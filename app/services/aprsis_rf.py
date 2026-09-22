@@ -275,7 +275,7 @@ def validate_aprsis_rf_target(target_name: Any, *, require_active: bool = True) 
     return target, None
 
 
-def validate_aprsis_source(source_name: Any) -> dict[str, Any] | None:
+def validate_aprsis_source(source_name: Any, *, require_enabled: bool = False) -> dict[str, Any] | None:
     name = str(source_name or "").strip()
     if not name:
         return None
@@ -289,18 +289,11 @@ def validate_aprsis_source(source_name: Any) -> dict[str, Any] | None:
         """,
         (name,),
     )
-    return dict(row) if row is not None else None
-
-
-def has_aprsis_interface() -> bool:
-    return fetch_one(
-        """
-        SELECT 1
-        FROM modems
-        WHERE UPPER(modem_type) = 'APRSIS'
-        LIMIT 1
-        """
-    ) is not None
+    if row is None:
+        return None
+    if require_enabled and int(row["enabled"] or 0) != 1:
+        return None
+    return dict(row)
 
 
 def normalize_outbound_rf_path(raw_path: Any) -> str:

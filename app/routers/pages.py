@@ -317,7 +317,7 @@ DATABASE_MAINTENANCE_TABLE_LABELS: dict[str, str] = {
     "traffic_device_station_device_hourly": "Traffic devices hourly stats",
     "radio_activity_5m": "Radio activity buckets",
     "aprsis_uplink_minute_stats": "APRS-IS uplink minute stats",
-    "aprsis_uplink_stats": "APRS-IS uplink counters",
+    "aprsis_connection_stats": "APRS-IS uplink counters",
     "wx_runtime_cache": "WX runtime cache",
     "band_condition_audibility_buckets": "Band condition audibility buckets",
     "band_condition_activity_station_buckets": "Band condition station buckets",
@@ -391,6 +391,48 @@ def _format_size_bytes(size_bytes: int) -> str:
 def _format_ratio_percent(ratio: float) -> str:
     normalized = max(0.0, float(ratio))
     return f"{normalized * 100:.1f}%"
+
+
+_APRSIS_DIAGNOSTICS_DEFAULT: dict[str, object] = {
+    "active_flow_count": 0,
+    "active_flow_names": [],
+    "session_uptime": "-",
+    "last_activity_at": None,
+    "tx": {
+        "sent_total": 0,
+        "sent_1h": 0,
+        "sent_24h": 0,
+        "drop_total": 0,
+        "drop_1h": 0,
+        "drop_24h": 0,
+        "last_sent_at": None,
+        "last_sent_frame_uid": None,
+        "last_sent_frame_line": None,
+        "last_drop_at": None,
+        "last_drop_frame_uid": None,
+        "last_drop_frame_line": None,
+    },
+    "strict_rejects": {
+        "total": 0,
+        "last_1h": 0,
+        "last_24h": 0,
+        "last_24h_blocked_tcpip_tcpxx": 0,
+        "last_24h_blocked_nogate_rfonly": 0,
+        "last_24h_malformed_third_party": 0,
+        "last_24h_other": 0,
+        "last_rejected_at": None,
+        "last_rejected_frame_uid": None,
+        "last_rejected_reason": None,
+        "last_rejected_frame_line": None,
+    },
+    "reconnects": {
+        "total": 0,
+        "last_24h": 0,
+        "last_connected_at": None,
+        "warning_total": 0,
+        "warning_24h": 0,
+    },
+}
 
 
 def _section_template_context(
@@ -478,8 +520,15 @@ def _section_template_context_scoped(
         prefetched_map_config=map_config,
     )
     if slug == "modems":
-        aprsis_config = get_aprsis_config()
+        aprsis_modem_id = (
+            int(edit_row["id"])
+            if edit_row and str(edit_row.get("modem_type") or "").strip().upper() == "APRSIS"
+            else None
+        )
+        aprsis_config = get_aprsis_config(aprsis_modem_id)
         modem_form_data: dict[str, object] = dict(edit_row or {})
+        for _aprsis_field in ("aprsis_server", "aprsis_port", "aprsis_login", "aprsis_passcode"):
+            modem_form_data.pop(_aprsis_field, None)
         if form_data:
             modem_form_data.update(form_data)
         if not edit_row and not form_data and initial_modem_type:
@@ -495,13 +544,17 @@ def _section_template_context_scoped(
             "aprsis_passcode",
             "" if aprsis_config["passcode_is_default"] else aprsis_config["passcode"],
         )
-        aprsis_runtime = get_aprsis_runtime_status()
+        aprsis_runtime = get_aprsis_runtime_status(aprsis_modem_id)
+        aprsis_diagnostics = (
+            get_aprsis_diagnostics(aprsis_modem_id) if aprsis_modem_id is not None else _APRSIS_DIAGNOSTICS_DEFAULT
+        )
         context.update(
             {
                 "modem_form_data": modem_form_data,
                 "aprsis_config": aprsis_config,
+                "aprsis_modem_id": aprsis_modem_id,
                 "aprsis_runtime": aprsis_runtime,
-                "aprsis_diagnostics": get_aprsis_diagnostics(),
+                "aprsis_diagnostics": aprsis_diagnostics,
                 "aprsis_runtime_badge": aprsis_runtime_badge(aprsis_runtime.get("status", "")),
             }
         )
@@ -583,13 +636,21 @@ def _path(request: Request, suffix: str) -> str:
     return f"{request.scope.get('root_path', '')}{suffix}"
 
 
-def _aprsis_interface_settings_path() -> str:
+def _first_aprsis_modem_id() -> int | None:
+    """Best-effort target for legacy single-connection APRS-IS endpoints
+    (/igate, /digi-flows/aprsis-config) that predate multiple connections and
+    have no way to specify which one to act on."""
     aprsis_interface = fetch_one(
         "SELECT id FROM modems WHERE UPPER(modem_type) = 'APRSIS' ORDER BY id ASC LIMIT 1"
     )
-    if aprsis_interface is None:
+    return int(aprsis_interface["id"]) if aprsis_interface is not None else None
+
+
+def _aprsis_interface_settings_path() -> str:
+    modem_id = _first_aprsis_modem_id()
+    if modem_id is None:
         return "/settings/modems?new_type=APRSIS"
-    return f"/settings/modems?edit={int(aprsis_interface['id'])}"
+    return f"/settings/modems?edit={modem_id}"
 
 
 def _safe_positive_int(value: Any) -> int:
@@ -1569,26 +1630,19 @@ def modems_create(
             )
             return error_response(str(exc), context)
     if record_id is None:
-        if normalized_modem_type == APRSIS_MODEM_TYPE:
-            existing_aprsis = fetch_one("SELECT id FROM modems WHERE UPPER(modem_type) = 'APRSIS' LIMIT 1")
-            if existing_aprsis is not None:
-                existing_id = int(existing_aprsis["id"])
-                context = _section_template_context(
-                    request,
-                    current_user,
-                    "modems",
-                    flash="An APRSIS interface already exists. Edit the existing interface instead.",
-                    edit_row=get_section_row("modems", existing_id),
-                )
-                return error_response("An APRSIS interface already exists. Edit the existing interface instead.", context)
         success, error = safe_create_section_row("modems", payload)
         edit_row = None
+        new_aprsis_modem_id: int | None = None
+        if success and normalized_aprsis_config is not None:
+            created_row = fetch_one("SELECT id FROM modems WHERE name = ?", (payload["name"],))
+            new_aprsis_modem_id = int(created_row["id"]) if created_row is not None else None
     else:
         success, error = safe_update_section_row("modems", record_id, payload)
         # Keep the form in edit mode after save; user exits via Cancel.
         edit_row = get_section_row("modems", record_id)
-    if success and normalized_aprsis_config is not None:
-        save_aprsis_config(normalized_aprsis_config)
+        new_aprsis_modem_id = record_id
+    if success and normalized_aprsis_config is not None and new_aprsis_modem_id is not None:
+        save_aprsis_config(new_aprsis_modem_id, normalized_aprsis_config)
     if wants_json:
         if not success:
             return JSONResponse(
@@ -2694,14 +2748,19 @@ def igate_settings_update(
     login: str = Form(""),
     passcode: str = Form(""),
 ) -> RedirectResponse:
-    success, error = safe_save_aprsis_config(
-        {
-            "server": server,
-            "port": port,
-            "login": login,
-            "passcode": passcode,
-        }
-    )
+    modem_id = _first_aprsis_modem_id()
+    if modem_id is None:
+        success, error = False, "No APRS-IS interface exists yet. Create one under Settings → Modems."
+    else:
+        success, error = safe_save_aprsis_config(
+            modem_id,
+            {
+                "server": server,
+                "port": port,
+                "login": login,
+                "passcode": passcode,
+            },
+        )
     target = _aprsis_interface_settings_path()
     message = "APRS-IS settings updated." if success else (error or "Failed to save APRS-IS settings.")
     return RedirectResponse(
@@ -2713,14 +2772,26 @@ def igate_settings_update(
 @router.get("/api/igate/diagnostics")
 def igate_diagnostics_api(
     _: UserIdentity = Depends(require_roles("admin", "operator")),
+    modem_id: int | None = None,
 ) -> JSONResponse:
-    runtime = get_aprsis_runtime_status()
+    target_modem_id = modem_id if modem_id is not None else _first_aprsis_modem_id()
+    if target_modem_id is None:
+        runtime = get_aprsis_runtime_status(None)
+        return JSONResponse(
+            {
+                "runtime": runtime,
+                "runtime_badge": aprsis_runtime_badge(runtime.get("status", "")),
+                "config": get_aprsis_config(None),
+                "diagnostics": _APRSIS_DIAGNOSTICS_DEFAULT,
+            }
+        )
+    runtime = get_aprsis_runtime_status(target_modem_id)
     return JSONResponse(
         {
             "runtime": runtime,
             "runtime_badge": aprsis_runtime_badge(runtime.get("status", "")),
-            "config": get_aprsis_config(),
-            "diagnostics": get_aprsis_diagnostics(),
+            "config": get_aprsis_config(target_modem_id),
+            "diagnostics": get_aprsis_diagnostics(target_modem_id),
         }
     )
 
@@ -2790,14 +2861,19 @@ def digi_flows_aprsis_config_update(
     login: str = Form(""),
     passcode: str = Form(""),
 ) -> RedirectResponse:
-    success, error = safe_save_aprsis_config(
-        {
-            "server": server,
-            "port": port,
-            "login": login,
-            "passcode": passcode,
-        }
-    )
+    modem_id = _first_aprsis_modem_id()
+    if modem_id is None:
+        success, error = False, "No APRS-IS interface exists yet. Create one under Settings → Modems."
+    else:
+        success, error = safe_save_aprsis_config(
+            modem_id,
+            {
+                "server": server,
+                "port": port,
+                "login": login,
+                "passcode": passcode,
+            },
+        )
     if not success:
         return RedirectResponse(
             url=_path(

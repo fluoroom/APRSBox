@@ -19,7 +19,6 @@ from app.services.aprsis_rf import (
     RF_GUARD_DEFAULTS,
     RF_GUARD_STEP_TYPE,
     RF_TX_GUARD_STEP_TYPE,
-    has_aprsis_interface,
     normalize_default_deny_config,
     normalize_outbound_rf_path,
     normalize_rf_guard_config,
@@ -1255,7 +1254,7 @@ def get_digi_flow_reference_options() -> dict[str, list[str]]:
     )
     aprsis_rows = fetch_all(
         """
-        SELECT name FROM modems
+        SELECT name, enabled FROM modems
         WHERE UPPER(modem_type) = 'APRSIS'
         ORDER BY name COLLATE NOCASE ASC, id ASC
         """
@@ -1265,7 +1264,7 @@ def get_digi_flow_reference_options() -> dict[str, list[str]]:
         APRSIS_FLOW_SOURCE_KIND: [str(row["name"]) for row in aprsis_rows if row["name"]],
         LOCAL_TX_SOURCE_KIND: [LOCAL_TX_SOURCE_REF],
         "tx_rf": [str(row["name"]) for row in target_rows if row["name"]],
-        "tx_aprsis": ["aprsis"] if aprsis_rows else [],
+        "tx_aprsis": [str(row["name"]) for row in aprsis_rows if row["name"]],
         "action_drop": ["drop"],
         "action_log": ["log-only"],
     }
@@ -1295,7 +1294,7 @@ def get_digi_flow_endpoint_options(
     )
     aprsis_rows = fetch_all(
         """
-        SELECT name FROM modems
+        SELECT name, enabled FROM modems
         WHERE UPPER(modem_type) = 'APRSIS'
         ORDER BY name COLLATE NOCASE ASC, id ASC
         """
@@ -1328,15 +1327,16 @@ def get_digi_flow_endpoint_options(
         for row in target_rows
         if row["name"]
     ]
-    if aprsis_rows:
-        target_options.append(
-            {
-                "value": "tx_aprsis::aprsis",
-                "label": _t("APRS-IS uplink"),
-                "kind": "tx_aprsis",
-                "ref": "aprsis",
-            }
-        )
+    target_options.extend(
+        {
+            "value": f"tx_aprsis::{row['name']}",
+            "label": f"{_t('APRS-IS uplink')} · {row['name']}",
+            "kind": "tx_aprsis",
+            "ref": str(row["name"]),
+        }
+        for row in aprsis_rows
+        if row["name"]
+    )
     if str(selected_target_selector or "").strip() == "action_drop::drop":
         target_options.append({"value": "action_drop::drop", "label": _t("Drop"), "kind": "action_drop", "ref": "drop"})
     target_options.append({"value": "action_log::log-only", "label": _t("Black Hole"), "kind": "action_log", "ref": "log-only"})
@@ -1407,7 +1407,7 @@ def _flow_endpoint_display(kind: Any, ref: Any, *, translate: Any = None) -> str
     translate = translate or _t
     if normalized_kind == LOCAL_TX_SOURCE_KIND and normalized_ref == LOCAL_TX_SOURCE_REF:
         return translate("Local TX")
-    if normalized_kind == "tx_aprsis":
+    if normalized_kind == "tx_aprsis" and not normalized_ref:
         return translate("APRS-IS uplink")
     if normalized_kind == "action_log" and normalized_ref == "log-only":
         return translate("Black Hole")
@@ -1823,8 +1823,6 @@ def normalize_digi_flow_payload(payload: dict[str, Any], *, existing_flow_id: in
     target_ref = _normalize_text(payload.get("target_ref"))
     if source_kind == LOCAL_TX_SOURCE_KIND and not source_ref:
         source_ref = LOCAL_TX_SOURCE_REF
-    if target_kind == "tx_aprsis" and not target_ref:
-        target_ref = "aprsis"
     if not source_ref:
         raise ValueError(_t("Flow source reference is required."))
     if source_kind == LOCAL_TX_SOURCE_KIND and target_kind not in LOCAL_TX_ALLOWED_TARGET_KINDS:
@@ -1835,6 +1833,8 @@ def normalize_digi_flow_payload(payload: dict[str, Any], *, existing_flow_id: in
         raise ValueError(_t("APRS-IS source must reference an existing APRSIS interface."))
     if target_kind in {"tx_rf", "tx_aprsis"} and not target_ref:
         raise ValueError(_t("Flow target reference is required."))
+    if target_kind == "tx_aprsis" and validate_aprsis_source(target_ref) is None:
+        raise ValueError(_t("APRS-IS target requires a defined APRSIS interface."))
     if source_kind == APRSIS_FLOW_SOURCE_KIND and target_kind == "tx_rf":
         _target, target_reason = validate_aprsis_rf_target(target_ref, require_active=True)
         if target_reason:
@@ -2045,8 +2045,6 @@ def normalize_digi_flow_payload(payload: dict[str, Any], *, existing_flow_id: in
         raise ValueError(_t("Flow source must match the first step type and reference."))
     if target_kind != last_step["step_type"] or target_ref != last_ref:
         raise ValueError(_t("Flow target must match the last step type and reference."))
-    if target_kind == "tx_aprsis" and not has_aprsis_interface():
-        raise ValueError(_t("APRS-IS target requires a defined APRSIS interface."))
     if _flow_requires_path_rule(source_kind, target_kind) and not _has_enabled_path_rule(normalized_steps):
         raise ValueError(_t("Flow with an RF TX target must include at least one enabled Path rule and DIGI guard step."))
 
@@ -2397,8 +2395,8 @@ def set_digi_flow_enabled(flow_id: int, enabled: bool) -> None:
                     )
         if target_kind == "tx_aprsis" and source_kind not in APRSIS_ALLOWED_SOURCE_KINDS:
             raise ValueError(_t("APRS-IS target flow must use Receiver RF or Local TX as source."))
-        if target_kind == "tx_aprsis" and not has_aprsis_interface():
-            raise ValueError(_t("APRS-IS target requires a defined APRSIS interface."))
+        if target_kind == "tx_aprsis" and validate_aprsis_source(flow.get("target_ref"), require_enabled=True) is None:
+            raise ValueError(_t("APRS-IS target requires a defined APRSIS interface that is enabled."))
         if target_kind == "tx_aprsis" and not _has_enabled_aprsis_strict_guard(flow_steps):
             raise ValueError(_t("DIGI Flow with an APRS-IS target cannot be enabled without a mandatory enabled Strict APRS-IS guard step."))
         with get_connection() as connection:

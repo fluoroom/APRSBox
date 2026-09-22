@@ -280,15 +280,17 @@ def get_section_row(
 def _decorate_modem_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     if not rows:
         return []
-    aprsis_tx_enabled = fetch_one(
-        """
-        SELECT 1
-        FROM digi_flows
-        WHERE enabled = 1
-          AND target_kind = 'tx_aprsis'
-        LIMIT 1
-        """
-    ) is not None
+    aprsis_tx_enabled_targets = {
+        str(row["target_ref"] or "").strip()
+        for row in fetch_all(
+            """
+            SELECT target_ref
+            FROM digi_flows
+            WHERE enabled = 1
+              AND target_kind = 'tx_aprsis'
+            """
+        )
+    }
     runtime_rows = fetch_all(
         """
         SELECT modem_id, status, status_detail, last_error
@@ -296,15 +298,19 @@ def _decorate_modem_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """
     )
     runtime_by_modem_id = {int(row["modem_id"]): dict(row) for row in runtime_rows if row["modem_id"] is not None}
-    aprsis_runtime_row = fetch_one(
-        "SELECT status, status_detail, last_error FROM aprsis_runtime_state WHERE id = 1"
+    aprsis_runtime_rows = fetch_all(
+        "SELECT modem_id, status, status_detail, last_error FROM aprsis_connection_runtime"
     )
+    aprsis_runtime_by_modem_id = {
+        int(row["modem_id"]): dict(row) for row in aprsis_runtime_rows if row["modem_id"] is not None
+    }
     for modem_row in rows:
         if str(modem_row.get("modem_type") or "").strip().upper() == APRSIS_MODEM_TYPE:
             modem_row["aprsis_rx_enabled"] = bool(modem_row.get("enabled"))
-            modem_row["aprsis_tx_enabled"] = aprsis_tx_enabled
+            modem_row["aprsis_tx_enabled"] = str(modem_row.get("name") or "").strip() in aprsis_tx_enabled_targets
+            aprsis_runtime_row = aprsis_runtime_by_modem_id.get(int(modem_row["id"]))
             if aprsis_runtime_row is not None:
-                runtime_by_modem_id[int(modem_row["id"])] = dict(aprsis_runtime_row)
+                runtime_by_modem_id[int(modem_row["id"])] = aprsis_runtime_row
     return [_decorate_modem_row(row, runtime_by_modem_id.get(int(row["id"]))) for row in rows]
 
 
@@ -377,8 +383,6 @@ def create_section_row(slug: str, payload: dict[str, Any]) -> None:
     definition = SECTION_DEFINITIONS[slug]
     timestamp = utc_now()
     normalized_payload = _normalize_section_payload(slug, payload)
-    if slug == "modems" and normalized_payload.get("modem_type") == APRSIS_MODEM_TYPE:
-        _ensure_single_aprsis_interface()
     values: dict[str, Any] = {}
     for field in definition.fields:
         name = field["name"]
@@ -413,8 +417,6 @@ def create_section_row(slug: str, payload: dict[str, Any]) -> None:
 def update_section_row(slug: str, row_id: int, payload: dict[str, Any]) -> None:
     definition = SECTION_DEFINITIONS[slug]
     normalized_payload = _normalize_section_payload(slug, payload)
-    if slug == "modems" and normalized_payload.get("modem_type") == APRSIS_MODEM_TYPE:
-        _ensure_single_aprsis_interface(exclude_id=row_id)
     previous_row: dict[str, Any] | None = None
     if slug == "modems":
         row = fetch_one(
@@ -1074,47 +1076,47 @@ def traffic_snapshot(limit: int = 400, *, alerts_only: bool = False) -> dict[str
                 "expose": expose,
             }
         )
-    aprsis_interface_row = fetch_one(
+    aprsis_interface_rows = fetch_all(
         """
         SELECT id, name, device_path
         FROM modems
         WHERE enabled = 1 AND UPPER(modem_type) = 'APRSIS'
         ORDER BY id ASC
-        LIMIT 1
         """
     )
-    if aprsis_interface_row is not None:
+    if aprsis_interface_rows:
         from app.services.aprsis import get_aprsis_runtime_status
 
-        aprsis_runtime = get_aprsis_runtime_status()
-        interfaces.append(
-            {
-                "modem_id": int(aprsis_interface_row["id"]),
-                "name": str(aprsis_interface_row["name"] or "APRSIS"),
-                "modem_type": APRSIS_MODEM_TYPE,
-                "device_path": str(aprsis_interface_row["device_path"] or DEFAULT_APRSIS_FILTER),
-                "band": "APRS-IS",
-                "status": str(aprsis_runtime.get("status") or "inactive"),
-                "status_detail": str(aprsis_runtime.get("status_detail") or ""),
-                "last_error": aprsis_runtime.get("last_error"),
-                "updated_at": _format_monitor_timestamp(aprsis_runtime.get("updated_at")),
-                "connected": str(aprsis_runtime.get("status") or "").lower() == "connected",
-                "subscribed_topic": "",
-                "broker_host": str(aprsis_runtime.get("server") or ""),
-                "broker_port": aprsis_runtime.get("port"),
-                "last_frame_time": None,
-                "frames_received": 0,
-                "duplicates_dropped": 0,
-                "invalid_json_dropped": 0,
-                "expose": {
-                    "enabled": False,
-                    "bind_address": None,
-                    "port": None,
-                    "active_clients": 0,
-                    "listen_endpoint": None,
-                },
-            }
-        )
+        for aprsis_interface_row in aprsis_interface_rows:
+            aprsis_runtime = get_aprsis_runtime_status(int(aprsis_interface_row["id"]))
+            interfaces.append(
+                {
+                    "modem_id": int(aprsis_interface_row["id"]),
+                    "name": str(aprsis_interface_row["name"] or "APRSIS"),
+                    "modem_type": APRSIS_MODEM_TYPE,
+                    "device_path": str(aprsis_interface_row["device_path"] or DEFAULT_APRSIS_FILTER),
+                    "band": "APRS-IS",
+                    "status": str(aprsis_runtime.get("status") or "inactive"),
+                    "status_detail": str(aprsis_runtime.get("status_detail") or ""),
+                    "last_error": aprsis_runtime.get("last_error"),
+                    "updated_at": _format_monitor_timestamp(aprsis_runtime.get("updated_at")),
+                    "connected": str(aprsis_runtime.get("status") or "").lower() == "connected",
+                    "subscribed_topic": "",
+                    "broker_host": str(aprsis_runtime.get("server") or ""),
+                    "broker_port": aprsis_runtime.get("port"),
+                    "last_frame_time": None,
+                    "frames_received": 0,
+                    "duplicates_dropped": 0,
+                    "invalid_json_dropped": 0,
+                    "expose": {
+                        "enabled": False,
+                        "bind_address": None,
+                        "port": None,
+                        "active_clients": 0,
+                        "listen_endpoint": None,
+                    },
+                }
+            )
     active_modem = None
     if interfaces:
         preferred = next((item for item in interfaces if item["status"] == "connected"), interfaces[0])
@@ -2178,8 +2180,26 @@ def dashboard_home_data(
         if str(item.get("modem_type") or "").strip().upper() == APRSIS_MODEM_TYPE
     ]
     enabled_aprsis_interfaces = [item for item in aprsis_interfaces if item.get("enabled")]
-    aprsis_runtime = get_aprsis_runtime_status() if enabled_aprsis_interfaces else {}
-    aprsis_runtime_status = str((aprsis_runtime or {}).get("status") or "").strip().lower()
+    enabled_aprsis_modem_ids: list[int] = []
+    for item in enabled_aprsis_interfaces:
+        try:
+            enabled_aprsis_modem_ids.append(int(item.get("id")))
+        except (TypeError, ValueError):
+            continue
+    aprsis_connection_statuses = [
+        str(get_aprsis_runtime_status(modem_id).get("status") or "").strip().lower()
+        for modem_id in enabled_aprsis_modem_ids
+    ]
+    if "connected" in aprsis_connection_statuses:
+        aprsis_runtime_status = "connected"
+    elif "connecting" in aprsis_connection_statuses:
+        aprsis_runtime_status = "connecting"
+    elif "error" in aprsis_connection_statuses:
+        aprsis_runtime_status = "error"
+    elif aprsis_connection_statuses:
+        aprsis_runtime_status = aprsis_connection_statuses[0]
+    else:
+        aprsis_runtime_status = ""
     location_configured = bool(station_settings.get("latitude")) and bool(station_settings.get("longitude"))
 
     interface_entries: list[dict[str, str]] = []
@@ -2276,7 +2296,15 @@ def dashboard_home_data(
         tx_runtime_status = "Stale"
         tx_runtime_tone = "warn"
 
-    aprsis_last_sent_row = fetch_one("SELECT last_sent_at FROM aprsis_uplink_stats WHERE id = 1")
+    aprsis_last_sent_row = (
+        fetch_one(
+            f"SELECT MAX(last_sent_at) AS last_sent_at FROM aprsis_connection_stats "
+            f"WHERE modem_id IN ({','.join('?' for _ in enabled_aprsis_modem_ids)})",
+            tuple(enabled_aprsis_modem_ids),
+        )
+        if enabled_aprsis_modem_ids
+        else None
+    )
     aprsis_last_sent_at = str(aprsis_last_sent_row["last_sent_at"] or "").strip() if aprsis_last_sent_row is not None else ""
     aprsis_last_sent_at = aprsis_last_sent_at or None
     aprsis_last_sent_display = _format_monitor_timestamp(aprsis_last_sent_at) if aprsis_last_sent_at else "No APRS-IS uplink yet"
@@ -5095,8 +5123,6 @@ def safe_create_section_row(slug: str, payload: dict[str, Any]) -> tuple[bool, s
     except ValueError as exc:
         return False, str(exc)
     except sqlite3.IntegrityError as exc:
-        if "idx_modems_single_aprsis" in str(exc) or "modems.modem_type" in str(exc):
-            return False, "An APRSIS interface already exists. Edit the existing interface instead."
         return False, str(exc)
     return True, None
 
@@ -5107,8 +5133,6 @@ def safe_update_section_row(slug: str, row_id: int, payload: dict[str, Any]) -> 
     except ValueError as exc:
         return False, str(exc)
     except sqlite3.IntegrityError as exc:
-        if "idx_modems_single_aprsis" in str(exc) or "modems.modem_type" in str(exc):
-            return False, "An APRSIS interface already exists. Edit the existing interface instead."
         return False, str(exc)
     return True, None
 
@@ -5192,18 +5216,6 @@ def _normalize_modem_payload(payload: dict[str, Any]) -> dict[str, Any]:
         payload.get("serial_rx_silence_reconnect_seconds")
     )
     return normalized
-
-
-def _ensure_single_aprsis_interface(*, exclude_id: int | None = None) -> None:
-    query = "SELECT id FROM modems WHERE UPPER(modem_type) = 'APRSIS'"
-    params: tuple[Any, ...] = ()
-    if exclude_id is not None:
-        query += " AND id <> ?"
-        params = (int(exclude_id),)
-    query += " LIMIT 1"
-    existing = fetch_one(query, params)
-    if existing is not None:
-        raise ValueError("An APRSIS interface already exists. Edit the existing interface instead.")
 
 
 def _normalize_aprs_entity_payload(kind: str, payload: dict[str, Any]) -> dict[str, Any]:

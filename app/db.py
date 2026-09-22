@@ -46,7 +46,7 @@ RUNTIME_MAINTENANCE_RESET_TABLES: tuple[str, ...] = (
     "traffic_device_station_device_hourly",
     "radio_activity_5m",
     "aprsis_uplink_minute_stats",
-    "aprsis_uplink_stats",
+    "aprsis_connection_stats",
     "wx_runtime_cache",
     "notification_radar_state",
     "band_condition_audibility_buckets",
@@ -222,6 +222,10 @@ CREATE TABLE IF NOT EXISTS modems (
     expose_port INTEGER NOT NULL DEFAULT 8002 CHECK (expose_port BETWEEN 1 AND 65535),
     expose_whitelist TEXT NOT NULL DEFAULT '',
     station_id INTEGER,
+    aprsis_server TEXT,
+    aprsis_port INTEGER,
+    aprsis_login TEXT,
+    aprsis_passcode TEXT,
     notes TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
@@ -815,8 +819,8 @@ CREATE TABLE IF NOT EXISTS traffic_runtime_state (
     updated_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS aprsis_runtime_state (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
+CREATE TABLE IF NOT EXISTS aprsis_connection_runtime (
+    modem_id INTEGER PRIMARY KEY,
     status TEXT NOT NULL DEFAULT 'inactive' CHECK (status IN ('inactive', 'connecting', 'connected', 'error')),
     status_detail TEXT NOT NULL DEFAULT '',
     server TEXT,
@@ -824,11 +828,12 @@ CREATE TABLE IF NOT EXISTS aprsis_runtime_state (
     login TEXT,
     connected_at TEXT,
     last_error TEXT,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (modem_id) REFERENCES modems(id) ON DELETE CASCADE
 );
 
-CREATE TABLE IF NOT EXISTS aprsis_uplink_stats (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
+CREATE TABLE IF NOT EXISTS aprsis_connection_stats (
+    modem_id INTEGER PRIMARY KEY,
     tx_total INTEGER NOT NULL DEFAULT 0,
     drop_total INTEGER NOT NULL DEFAULT 0,
     strict_total INTEGER NOT NULL DEFAULT 0,
@@ -843,11 +848,13 @@ CREATE TABLE IF NOT EXISTS aprsis_uplink_stats (
     last_strict_reject_at TEXT,
     last_strict_reject_line TEXT,
     last_strict_reject_reason TEXT,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (modem_id) REFERENCES modems(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS aprsis_uplink_minute_stats (
-    bucket_minute_utc TEXT PRIMARY KEY,
+    modem_id INTEGER NOT NULL,
+    bucket_minute_utc TEXT NOT NULL,
     tx_count INTEGER NOT NULL DEFAULT 0,
     drop_count INTEGER NOT NULL DEFAULT 0,
     strict_count INTEGER NOT NULL DEFAULT 0,
@@ -855,7 +862,9 @@ CREATE TABLE IF NOT EXISTS aprsis_uplink_minute_stats (
     strict_blocked_nogate_rfonly_count INTEGER NOT NULL DEFAULT 0,
     strict_malformed_third_party_count INTEGER NOT NULL DEFAULT 0,
     strict_other_count INTEGER NOT NULL DEFAULT 0,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (modem_id, bucket_minute_utc),
+    FOREIGN KEY (modem_id) REFERENCES modems(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS traffic_runtime_interfaces (
@@ -1089,9 +1098,6 @@ CREATE INDEX IF NOT EXISTS idx_own_aprs_alerts_status_next
     ON own_aprs_alerts(status, next_transmission_at, id);
 CREATE INDEX IF NOT EXISTS idx_own_aprs_alert_tx_jobs_dispatch
     ON own_aprs_alert_tx_jobs(dispatch_token, outbound_job_id);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_modems_single_aprsis
-    ON modems(UPPER(modem_type))
-    WHERE UPPER(modem_type) = 'APRSIS';
 CREATE INDEX IF NOT EXISTS idx_traffic_device_station_device_hourly_bucket
     ON traffic_device_station_device_hourly(bucket_start_utc, station_key);
 CREATE INDEX IF NOT EXISTS idx_traffic_runtime_interfaces_status_updated_at ON traffic_runtime_interfaces(status, updated_at DESC);
@@ -1562,6 +1568,14 @@ def init_db() -> None:
                 ADD COLUMN expose_whitelist TEXT NOT NULL DEFAULT ''
                 """
             )
+        if "aprsis_server" not in modem_columns:
+            connection.execute("ALTER TABLE modems ADD COLUMN aprsis_server TEXT")
+        if "aprsis_port" not in modem_columns:
+            connection.execute("ALTER TABLE modems ADD COLUMN aprsis_port INTEGER")
+        if "aprsis_login" not in modem_columns:
+            connection.execute("ALTER TABLE modems ADD COLUMN aprsis_login TEXT")
+        if "aprsis_passcode" not in modem_columns:
+            connection.execute("ALTER TABLE modems ADD COLUMN aprsis_passcode TEXT")
         if "local_cache_enabled" not in map_columns:
             connection.execute(
                 """
@@ -1844,30 +1858,6 @@ CREATE INDEX IF NOT EXISTS idx_aprs_messages_direction_unread_conversation
     ON aprs_messages(direction, is_unread, conversation_id)
 """
         )
-        connection.execute(
-            """
-            INSERT INTO aprsis_runtime_state (
-                id, status, status_detail, server, port, login, connected_at, last_error, updated_at
-            )
-            VALUES (1, 'inactive', 'APRS-IS uplink is inactive.', NULL, NULL, NULL, NULL, NULL, ?)
-            ON CONFLICT(id) DO NOTHING
-            """,
-            (utc_now(),),
-        )
-        connection.execute(
-            """
-            INSERT INTO aprsis_uplink_stats (
-                id, tx_total, drop_total, strict_total,
-                strict_blocked_tcpip_tcpxx_total, strict_blocked_nogate_rfonly_total,
-                strict_malformed_third_party_total, strict_other_total,
-                last_sent_at, last_sent_line, last_drop_at, last_drop_line,
-                last_strict_reject_at, last_strict_reject_line, last_strict_reject_reason, updated_at
-            )
-            VALUES (1, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?)
-            ON CONFLICT(id) DO NOTHING
-            """,
-            (utc_now(),),
-        )
         if "state" not in object_columns:
             connection.execute(
                 """
@@ -2060,6 +2050,7 @@ CREATE INDEX IF NOT EXISTS idx_aprs_messages_direction_unread_conversation
                 """
             )
         _migrate_default_station_from_station_settings(connection)
+        _migrate_aprsis_multi_connection(connection)
         _normalize_map_sources_table(connection)
         connection.commit()
         _run_database_index_repair_for_update(connection)
@@ -2116,6 +2107,88 @@ def _migrate_default_station_from_station_settings(connection: sqlite3.Connectio
             "now": now,
         },
     )
+
+
+def _migrate_aprsis_multi_connection(connection: sqlite3.Connection) -> None:
+    """Drop the legacy single-APRS-IS-connection constraint/tables and carry
+    forward any existing global APRS-IS settings onto the one modem row that
+    used to be the sole allowed APRSIS interface."""
+    connection.execute("DROP INDEX IF EXISTS idx_modems_single_aprsis")
+
+    legacy_runtime_state_exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'aprsis_runtime_state'"
+    ).fetchone()
+    if legacy_runtime_state_exists is not None:
+        legacy_modem = connection.execute(
+            "SELECT id, name, aprsis_server FROM modems WHERE UPPER(modem_type) = 'APRSIS' ORDER BY id ASC LIMIT 1"
+        ).fetchone()
+        if legacy_modem is not None and not str(legacy_modem["aprsis_server"] or "").strip():
+            legacy_settings = {
+                row["key"]: row["value"]
+                for row in connection.execute(
+                    "SELECT key, value FROM app_settings WHERE key IN ("
+                    "'aprsis_server', 'aprsis_port', 'aprsis_login', 'aprsis_passcode'"
+                    ")"
+                ).fetchall()
+            }
+            if legacy_settings.get("aprsis_server"):
+                connection.execute(
+                    """
+                    UPDATE modems
+                    SET aprsis_server = :server,
+                        aprsis_port = :port,
+                        aprsis_login = :login,
+                        aprsis_passcode = :passcode
+                    WHERE id = :modem_id
+                    """,
+                    {
+                        "server": legacy_settings.get("aprsis_server"),
+                        "port": legacy_settings.get("aprsis_port"),
+                        "login": legacy_settings.get("aprsis_login") or None,
+                        "passcode": legacy_settings.get("aprsis_passcode") or None,
+                        "modem_id": legacy_modem["id"],
+                    },
+                )
+        if legacy_modem is not None:
+            connection.execute(
+                """
+                UPDATE digi_flows
+                SET target_ref = ?
+                WHERE target_kind = 'tx_aprsis' AND target_ref = 'aprsis'
+                """,
+                (str(legacy_modem["name"]),),
+            )
+        connection.execute("DROP TABLE aprsis_runtime_state")
+
+    legacy_uplink_stats_exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'aprsis_uplink_stats'"
+    ).fetchone()
+    if legacy_uplink_stats_exists is not None:
+        connection.execute("DROP TABLE aprsis_uplink_stats")
+
+    minute_stats_columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(aprsis_uplink_minute_stats)").fetchall()
+    }
+    if minute_stats_columns and "modem_id" not in minute_stats_columns:
+        connection.execute("DROP TABLE aprsis_uplink_minute_stats")
+        connection.execute(
+            """
+            CREATE TABLE aprsis_uplink_minute_stats (
+                modem_id INTEGER NOT NULL,
+                bucket_minute_utc TEXT NOT NULL,
+                tx_count INTEGER NOT NULL DEFAULT 0,
+                drop_count INTEGER NOT NULL DEFAULT 0,
+                strict_count INTEGER NOT NULL DEFAULT 0,
+                strict_blocked_tcpip_tcpxx_count INTEGER NOT NULL DEFAULT 0,
+                strict_blocked_nogate_rfonly_count INTEGER NOT NULL DEFAULT 0,
+                strict_malformed_third_party_count INTEGER NOT NULL DEFAULT 0,
+                strict_other_count INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (modem_id, bucket_minute_utc),
+                FOREIGN KEY (modem_id) REFERENCES modems(id) ON DELETE CASCADE
+            )
+            """
+        )
 
 
 def _migrate_aprs_alert_identity(connection: sqlite3.Connection) -> None:

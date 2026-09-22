@@ -37,16 +37,30 @@ def temporary_database() -> Path:
                 os.environ["APRSBOX_DB_PATH"] = previous
 
 
-def insert_tx_aprsis_flow(*, name: str, enabled: int = 1) -> int:
+def insert_aprsis_modem(*, name: str = "APRS-IS", enabled: int = 1) -> int:
+    now = utc_now()
+    execute(
+        """
+        INSERT INTO modems (name, modem_type, band, enabled, created_at, updated_at)
+        VALUES (?, 'APRSIS', '', ?, ?, ?)
+        """,
+        (name, int(enabled), now, now),
+    )
+    row = fetch_one("SELECT id FROM modems WHERE name = ?", (name,))
+    assert row is not None
+    return int(row["id"])
+
+
+def insert_tx_aprsis_flow(*, name: str, target_ref: str, enabled: int = 1) -> int:
     now = utc_now()
     execute(
         """
         INSERT INTO digi_flows (
             name, description, source_kind, source_ref, target_kind, target_ref, enabled, created_at, updated_at
         )
-        VALUES (?, '', 'receiver_rf', ?, 'tx_aprsis', 'aprsis', ?, ?, ?)
+        VALUES (?, '', 'receiver_rf', ?, 'tx_aprsis', ?, ?, ?, ?)
         """,
-        (name, f"RF-{name}", int(enabled), now, now),
+        (name, f"RF-{name}", target_ref, int(enabled), now, now),
     )
     row = fetch_one("SELECT id FROM digi_flows WHERE name = ?", (name,))
     assert row is not None
@@ -56,7 +70,8 @@ def insert_tx_aprsis_flow(*, name: str, enabled: int = 1) -> int:
 class AprsisDiagnosticsTests(unittest.TestCase):
     def test_get_aprsis_diagnostics_returns_zeroed_payload_without_events(self) -> None:
         with temporary_database():
-            diagnostics = get_aprsis_diagnostics()
+            modem_id = insert_aprsis_modem(name="APRS-IS")
+            diagnostics = get_aprsis_diagnostics(modem_id)
             self.assertEqual(diagnostics["active_flow_count"], 0)
             self.assertEqual(diagnostics["active_flow_names"], [])
             self.assertEqual(diagnostics["session_uptime"], "-")
@@ -68,8 +83,9 @@ class AprsisDiagnosticsTests(unittest.TestCase):
 
     def test_get_aprsis_diagnostics_aggregates_tx_and_strict_guard_stats(self) -> None:
         with temporary_database():
-            insert_tx_aprsis_flow(name="APRSIS-1", enabled=1)
-            insert_tx_aprsis_flow(name="APRSIS-disabled", enabled=0)
+            modem_id = insert_aprsis_modem(name="APRS-IS")
+            insert_tx_aprsis_flow(name="APRSIS-1", target_ref="APRS-IS", enabled=1)
+            insert_tx_aprsis_flow(name="APRSIS-disabled", target_ref="APRS-IS", enabled=0)
             now_dt = datetime.now(timezone.utc).replace(microsecond=0)
             now = now_dt.isoformat()
             two_hours_ago = (now_dt - timedelta(hours=2)).isoformat()
@@ -78,6 +94,7 @@ class AprsisDiagnosticsTests(unittest.TestCase):
             last_blocked_line = "SP8ABC-9>APRS,TCPIP*:>BLOCKED SAMPLE"
 
             persist_aprsis_runtime_status(
+                modem_id,
                 status="connected",
                 status_detail="Connected",
                 server="rotate.aprs2.net",
@@ -87,37 +104,42 @@ class AprsisDiagnosticsTests(unittest.TestCase):
                 last_error=None,
             )
 
-            record_aprsis_tx_result(sent=True, frame_line="SQ9MDD-4>APRS,WIDE1-1:>OLD TX", occurred_at=thirty_hours_ago)
-            record_aprsis_tx_result(sent=True, frame_line="SQ9MDD-4>APRS,WIDE1-1:>24H TX", occurred_at=two_hours_ago)
-            record_aprsis_tx_result(sent=True, frame_line=last_sent_line, occurred_at=now)
-            record_aprsis_tx_result(sent=False, frame_line="SQ9MDD-4>APRS:>DROP OLD", occurred_at=thirty_hours_ago)
-            record_aprsis_tx_result(sent=False, frame_line="SQ9MDD-4>APRS:>DROP NOW", occurred_at=now)
+            record_aprsis_tx_result(modem_id, sent=True, frame_line="SQ9MDD-4>APRS,WIDE1-1:>OLD TX", occurred_at=thirty_hours_ago)
+            record_aprsis_tx_result(modem_id, sent=True, frame_line="SQ9MDD-4>APRS,WIDE1-1:>24H TX", occurred_at=two_hours_ago)
+            record_aprsis_tx_result(modem_id, sent=True, frame_line=last_sent_line, occurred_at=now)
+            record_aprsis_tx_result(modem_id, sent=False, frame_line="SQ9MDD-4>APRS:>DROP OLD", occurred_at=thirty_hours_ago)
+            record_aprsis_tx_result(modem_id, sent=False, frame_line="SQ9MDD-4>APRS:>DROP NOW", occurred_at=now)
 
             record_aprsis_strict_reject(
+                modem_id,
                 reason_key=APRSIS_STRICT_REASON_OTHER,
                 frame_line="SP8ABC-9>APRS:>OLD STRICT",
                 reason_message="Strict filter rejected frame because old policy scope is blocked.",
                 occurred_at=thirty_hours_ago,
             )
             record_aprsis_strict_reject(
+                modem_id,
                 reason_key=APRSIS_STRICT_REASON_BLOCKED_TCPIP_TCPXX,
                 frame_line="SP8ABC-9>APRS,TCPXX*:>STRICT TCP",
                 reason_message="Strict filter rejected frame because outer path contains blocked token TCPXX.",
                 occurred_at=now,
             )
             record_aprsis_strict_reject(
+                modem_id,
                 reason_key=APRSIS_STRICT_REASON_BLOCKED_NOGATE_RFONLY,
                 frame_line="SP8ABC-9>APRS,NOGATE*:>STRICT NOGATE",
                 reason_message="Strict filter rejected frame because outer path contains blocked token NOGATE.",
                 occurred_at=now,
             )
             record_aprsis_strict_reject(
+                modem_id,
                 reason_key=APRSIS_STRICT_REASON_MALFORMED_THIRD_PARTY,
                 frame_line="SP8ABC-9>APRS:}INVALID THIRD PARTY",
                 reason_message="Strict filter rejected frame because third-party encapsulation is malformed or invalid.",
                 occurred_at=now,
             )
             record_aprsis_strict_reject(
+                modem_id,
                 reason_key=APRSIS_STRICT_REASON_OTHER,
                 frame_line=last_blocked_line,
                 reason_message="Strict filter rejected frame because policy scope is blocked.",
@@ -139,7 +161,7 @@ class AprsisDiagnosticsTests(unittest.TestCase):
                 (now,),
             )
 
-            diagnostics = get_aprsis_diagnostics()
+            diagnostics = get_aprsis_diagnostics(modem_id)
 
             self.assertEqual(diagnostics["active_flow_count"], 1)
             self.assertEqual(diagnostics["active_flow_names"], ["APRSIS-1"])
@@ -190,7 +212,8 @@ class AprsisClientRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
         with temporary_database():
-            service = AprsisClientService()
+            modem_id = insert_aprsis_modem()
+            service = AprsisClientService(modem_id)
             writer = RecordingWriter()
             service._writer = writer  # type: ignore[assignment]
 
@@ -218,7 +241,8 @@ class AprsisClientRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
         with temporary_database():
-            service = AprsisClientService()
+            modem_id = insert_aprsis_modem()
+            service = AprsisClientService(modem_id)
             writer = RecordingWriter()
             service._writer = writer  # type: ignore[assignment]
 
@@ -260,7 +284,8 @@ class AprsisClientRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
         with temporary_database():
-            service = AprsisClientService(reconnect_delay=0.1)
+            modem_id = insert_aprsis_modem()
+            service = AprsisClientService(modem_id, reconnect_delay=0.1)
             writer = BufferedWriter()
             service._writer = writer  # type: ignore[assignment]
             service._connected_config = ("rotate.aprs2.net", 14580, "SQ9MDD-4", "12345")
@@ -301,7 +326,8 @@ class AprsisClientRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
         with temporary_database():
-            service = AprsisClientService(reconnect_delay=0.1)
+            modem_id = insert_aprsis_modem()
+            service = AprsisClientService(modem_id, reconnect_delay=0.1)
             writer = RetainingWriter()
             service._writer = writer  # type: ignore[assignment]
             service._connected_config = ("rotate.aprs2.net", 14580, "SQ9MDD-4", "12345")
@@ -330,7 +356,8 @@ class AprsisClientRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
         with temporary_database():
-            service = AprsisClientService()
+            modem_id = insert_aprsis_modem()
+            service = AprsisClientService(modem_id)
             dropped_line = "SQ9MDD-9>APRS,WIDE1-1:>Must not be replayed"
 
             success, detail = await service.send_tnc2_line(dropped_line)
@@ -365,7 +392,8 @@ class AprsisClientRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 self.write_called = True
 
         with temporary_database():
-            service = AprsisClientService()
+            modem_id = insert_aprsis_modem()
+            service = AprsisClientService(modem_id)
             writer = ClosingWriter()
             service._writer = writer  # type: ignore[assignment]
 
@@ -393,7 +421,8 @@ class AprsisClientRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
         with temporary_database():
-            service = AprsisClientService(reconnect_delay=0.1)
+            modem_id = insert_aprsis_modem()
+            service = AprsisClientService(modem_id, reconnect_delay=0.1)
             service._writer = HangingWriter()  # type: ignore[assignment]
             service._connected_config = ("rotate.aprs2.net", 14580, "SQ9MDD-4", "12345")
             service._connected_since = utc_now()

@@ -38,7 +38,7 @@ from app.services.alarm_groups import (
 from app.services.aprsis import (
     AprsisClientService,
     build_aprsis_login_line,
-    get_enabled_aprsis_interface,
+    get_aprsis_interface,
 )
 from app.services.aprs_warning_identity import (
     parse_aprs_group_warning_content,
@@ -494,7 +494,7 @@ class AprsAlarmGroupFilterTests(unittest.TestCase):
     def test_effective_filter_appends_missing_groups_without_mutating_manual_filter(self) -> None:
         with configured_alarm_database():
             interface_id = insert_aprsis_interface("m/100")
-            interface = get_enabled_aprsis_interface()
+            interface = get_aprsis_interface(interface_id)
             self.assertEqual((interface or {}).get("filter"), "m/100")
             self.assertEqual(
                 (interface or {}).get("effective_filter"),
@@ -531,17 +531,17 @@ class AprsAlarmGroupFilterTests(unittest.TestCase):
 
     def test_alarm_group_change_uses_existing_filter_signature_reconnect(self) -> None:
         with configured_alarm_database():
-            insert_aprsis_interface("m/100")
-            before = get_enabled_aprsis_interface()
+            interface_id = insert_aprsis_interface("m/100")
+            before = get_aprsis_interface(interface_id)
             assert before is not None
-            service = AprsisClientService()
+            service = AprsisClientService(interface_id)
             config_key = ("example.aprs2.net", 14580, "SP0BOX-1", "12345")
             service._writer = object()  # type: ignore[assignment]
             service._connected_config = config_key
             service._connected_rx_signature = service._rx_signature(before)
 
             save_aprs_alarm_groups("PL-WARN,LOCALWARN")
-            after = get_enabled_aprsis_interface()
+            after = get_aprsis_interface(interface_id)
 
             self.assertTrue(
                 service._connection_needs_reconnect(
@@ -552,7 +552,7 @@ class AprsAlarmGroupFilterTests(unittest.TestCase):
 
     def test_aprsis_message_group_change_uses_filter_signature_reconnect(self) -> None:
         with temporary_database():
-            insert_aprsis_interface("m/100")
+            interface_id = insert_aprsis_interface("m/100")
             save_message_settings(
                 {
                     "default_path": "",
@@ -561,9 +561,9 @@ class AprsAlarmGroupFilterTests(unittest.TestCase):
                     "aprsis_target_groups": ["CQ"],
                 }
             )
-            before = get_enabled_aprsis_interface()
+            before = get_aprsis_interface(interface_id)
             assert before is not None
-            service = AprsisClientService()
+            service = AprsisClientService(interface_id)
             config_key = ("example.aprs2.net", 14580, "SP0BOX-1", "12345")
             service._writer = object()  # type: ignore[assignment]
             service._connected_config = config_key
@@ -577,7 +577,7 @@ class AprsAlarmGroupFilterTests(unittest.TestCase):
                     "aprsis_target_groups": ["LOCAL"],
                 }
             )
-            after = get_enabled_aprsis_interface()
+            after = get_aprsis_interface(interface_id)
 
             self.assertTrue(
                 service._connection_needs_reconnect(
@@ -588,17 +588,17 @@ class AprsAlarmGroupFilterTests(unittest.TestCase):
 
     def test_global_alarm_toggle_uses_existing_filter_signature_reconnect(self) -> None:
         with configured_alarm_database():
-            insert_aprsis_interface("m/100")
-            before = get_enabled_aprsis_interface()
+            interface_id = insert_aprsis_interface("m/100")
+            before = get_aprsis_interface(interface_id)
             assert before is not None
-            service = AprsisClientService()
+            service = AprsisClientService(interface_id)
             config_key = ("example.aprs2.net", 14580, "SP0BOX-1", "12345")
             service._writer = object()  # type: ignore[assignment]
             service._connected_config = config_key
             service._connected_rx_signature = service._rx_signature(before)
 
             save_aprs_alarm_enabled(False)
-            after = get_enabled_aprsis_interface()
+            after = get_aprsis_interface(interface_id)
 
             self.assertEqual((after or {}).get("effective_filter"), "m/100")
             self.assertTrue(

@@ -6,11 +6,13 @@ import re
 import socket
 import time
 from datetime import datetime, timedelta, timezone
+from threading import Lock
 from typing import Any, Callable
 
 from app import get_version
-from app.db import fetch_one, get_app_setting, get_connection, log_event, set_app_setting, utc_now
+from app.db import fetch_all, fetch_one, get_connection, log_event, utc_now
 from app.services.alarm_groups import build_effective_aprsis_filter
+from app.services.aprsis_tx_dispatcher import AprsIsTxDispatcher
 from app.services.rx_side_effect_dispatcher import (
     RX_SIDE_EFFECT_QUEUE_MAX_FRAMES,
     RxSideEffectDispatcher,
@@ -102,30 +104,44 @@ def derive_aprsis_passcode(callsign: str) -> str:
     return str(value & 0x7FFF)
 
 
-def _stored_aprsis_port() -> int:
-    raw = _normalize_text(get_app_setting("aprsis_port"))
-    if not raw:
+def _fetch_aprsis_modem_row(modem_id: int | None) -> Any:
+    if modem_id is None:
+        return None
+    return fetch_one(
+        """
+        SELECT id, name, aprsis_server, aprsis_port, aprsis_login, aprsis_passcode
+        FROM modems
+        WHERE id = ? AND UPPER(modem_type) = 'APRSIS'
+        """,
+        (int(modem_id),),
+    )
+
+
+def _stored_aprsis_port(row: Any) -> int:
+    raw_port = row["aprsis_port"] if row is not None else None
+    if raw_port is None:
         return DEFAULT_APRSIS_PORT
     try:
-        parsed = int(raw)
-    except ValueError:
+        parsed = int(raw_port)
+    except (TypeError, ValueError):
         return DEFAULT_APRSIS_PORT
     if parsed < 1 or parsed > 65535:
         return DEFAULT_APRSIS_PORT
     return parsed
 
 
-def get_aprsis_config() -> dict[str, Any]:
-    host = _normalize_text(get_app_setting("aprsis_server")) or DEFAULT_APRSIS_SERVER
-    port = _stored_aprsis_port()
+def get_aprsis_config(modem_id: int | None) -> dict[str, Any]:
+    row = _fetch_aprsis_modem_row(modem_id)
+    host = _normalize_text(row["aprsis_server"] if row is not None else None) or DEFAULT_APRSIS_SERVER
+    port = _stored_aprsis_port(row)
 
-    login_override = _normalize_callsign(get_app_setting("aprsis_login"))
+    login_override = _normalize_callsign(row["aprsis_login"] if row is not None else None)
     if login_override and not _CALLSIGN_RE.fullmatch(login_override):
         login_override = ""
     login_default = station_login_default()
     login = login_override or login_default
 
-    passcode_override = _normalize_text(get_app_setting("aprsis_passcode"))
+    passcode_override = _normalize_text(row["aprsis_passcode"] if row is not None else None)
     if passcode_override and not _PASSCODE_RE.fullmatch(passcode_override):
         passcode_override = ""
     passcode_default = derive_aprsis_passcode(login or login_default)
@@ -196,20 +212,36 @@ def normalize_aprsis_config_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def save_aprsis_config(payload: dict[str, Any]) -> dict[str, Any]:
+def save_aprsis_config(modem_id: int, payload: dict[str, Any]) -> dict[str, Any]:
     normalized = normalize_aprsis_config_payload(payload)
 
-    set_app_setting("aprsis_server", str(normalized["server"]))
-    set_app_setting("aprsis_port", str(normalized["port"]))
-    set_app_setting("aprsis_login", str(normalized["login"]))
-    set_app_setting("aprsis_passcode", str(normalized["passcode"]))
+    with get_connection() as connection:
+        connection.execute(
+            """
+            UPDATE modems
+            SET aprsis_server = ?,
+                aprsis_port = ?,
+                aprsis_login = ?,
+                aprsis_passcode = ?,
+                updated_at = ?
+            WHERE id = ? AND UPPER(modem_type) = 'APRSIS'
+            """,
+            (
+                str(normalized["server"]),
+                int(normalized["port"]),
+                str(normalized["login"]),
+                str(normalized["passcode"]),
+                utc_now(),
+                int(modem_id),
+            ),
+        )
     log_event("INFO", "config", "Updated APRS-IS interface connection settings")
-    return get_aprsis_config()
+    return get_aprsis_config(modem_id)
 
 
-def safe_save_aprsis_config(payload: dict[str, Any]) -> tuple[bool, str | None]:
+def safe_save_aprsis_config(modem_id: int, payload: dict[str, Any]) -> tuple[bool, str | None]:
     try:
-        save_aprsis_config(payload)
+        save_aprsis_config(modem_id, payload)
     except ValueError as exc:
         return False, str(exc)
     return True, None
@@ -228,19 +260,7 @@ def has_enabled_aprsis_target_flow() -> bool:
     return row is not None
 
 
-def get_enabled_aprsis_interface() -> dict[str, Any] | None:
-    row = fetch_one(
-        """
-        SELECT id, name, device_path, enabled, updated_at
-        FROM modems
-        WHERE enabled = 1
-          AND UPPER(modem_type) = 'APRSIS'
-        ORDER BY id ASC
-        LIMIT 1
-        """
-    )
-    if row is None:
-        return None
+def _decorate_aprsis_interface_row(row: Any) -> dict[str, Any]:
     result = dict(row)
     try:
         result["filter"] = normalize_aprsis_filter(result.get("device_path"))
@@ -251,8 +271,32 @@ def get_enabled_aprsis_interface() -> dict[str, Any] | None:
     return result
 
 
-def aprsis_connection_required() -> bool:
-    return get_enabled_aprsis_interface() is not None
+def list_enabled_aprsis_interfaces() -> list[dict[str, Any]]:
+    rows = fetch_all(
+        """
+        SELECT id, name, device_path, enabled, updated_at
+        FROM modems
+        WHERE enabled = 1
+          AND UPPER(modem_type) = 'APRSIS'
+        ORDER BY id ASC
+        """
+    )
+    return [_decorate_aprsis_interface_row(row) for row in rows]
+
+
+def get_aprsis_interface(modem_id: int) -> dict[str, Any] | None:
+    row = fetch_one(
+        """
+        SELECT id, name, device_path, enabled, updated_at
+        FROM modems
+        WHERE id = ?
+          AND UPPER(modem_type) = 'APRSIS'
+        """,
+        (int(modem_id),),
+    )
+    if row is None:
+        return None
+    return _decorate_aprsis_interface_row(row)
 
 
 def build_aprsis_login_line(*, login: str, passcode: str, server_filter: str = "") -> str:
@@ -264,6 +308,7 @@ def build_aprsis_login_line(*, login: str, passcode: str, server_filter: str = "
 
 
 def persist_aprsis_runtime_status(
+    modem_id: int,
     *,
     status: str,
     status_detail: str,
@@ -280,12 +325,12 @@ def persist_aprsis_runtime_status(
     with get_connection() as connection:
         connection.execute(
             """
-            INSERT INTO aprsis_runtime_state (
-                id, status, status_detail, server, port, login,
+            INSERT INTO aprsis_connection_runtime (
+                modem_id, status, status_detail, server, port, login,
                 connected_at, last_error, updated_at
             )
-            VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(modem_id) DO UPDATE SET
                 status = excluded.status,
                 status_detail = excluded.status_detail,
                 server = excluded.server,
@@ -296,6 +341,7 @@ def persist_aprsis_runtime_status(
                 updated_at = excluded.updated_at
             """,
             (
+                int(modem_id),
                 normalized_status,
                 str(status_detail or ""),
                 server,
@@ -308,8 +354,8 @@ def persist_aprsis_runtime_status(
         )
 
 
-def get_aprsis_runtime_status() -> dict[str, Any]:
-    row = fetch_one("SELECT * FROM aprsis_runtime_state WHERE id = 1")
+def get_aprsis_runtime_status(modem_id: int | None) -> dict[str, Any]:
+    row = fetch_one("SELECT * FROM aprsis_connection_runtime WHERE modem_id = ?", (int(modem_id),)) if modem_id is not None else None
     if row is None:
         return {
             "status": APRSIS_STATUS_INACTIVE,
@@ -407,6 +453,7 @@ def _max_timestamp(values: list[str | None]) -> str | None:
 def _upsert_aprsis_minute_bucket(
     connection: Any,
     *,
+    modem_id: int,
     bucket_minute_utc: str,
     tx_count: int = 0,
     drop_count: int = 0,
@@ -420,6 +467,7 @@ def _upsert_aprsis_minute_bucket(
     connection.execute(
         """
         INSERT INTO aprsis_uplink_minute_stats (
+            modem_id,
             bucket_minute_utc,
             tx_count,
             drop_count,
@@ -430,8 +478,8 @@ def _upsert_aprsis_minute_bucket(
             strict_other_count,
             updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(bucket_minute_utc) DO UPDATE SET
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(modem_id, bucket_minute_utc) DO UPDATE SET
             tx_count = tx_count + excluded.tx_count,
             drop_count = drop_count + excluded.drop_count,
             strict_count = strict_count + excluded.strict_count,
@@ -442,6 +490,7 @@ def _upsert_aprsis_minute_bucket(
             updated_at = excluded.updated_at
         """,
         (
+            int(modem_id),
             bucket_minute_utc,
             int(tx_count),
             int(drop_count),
@@ -466,24 +515,24 @@ def _prune_aprsis_minute_stats(connection: Any) -> None:
     )
 
 
-def _ensure_aprsis_uplink_stats_row(connection: Any) -> None:
+def _ensure_aprsis_uplink_stats_row(connection: Any, modem_id: int) -> None:
     connection.execute(
         """
-        INSERT INTO aprsis_uplink_stats (
-            id, tx_total, drop_total, strict_total,
+        INSERT INTO aprsis_connection_stats (
+            modem_id, tx_total, drop_total, strict_total,
             strict_blocked_tcpip_tcpxx_total, strict_blocked_nogate_rfonly_total,
             strict_malformed_third_party_total, strict_other_total,
             last_sent_at, last_sent_line, last_drop_at, last_drop_line,
             last_strict_reject_at, last_strict_reject_line, last_strict_reject_reason, updated_at
         )
-        VALUES (1, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?)
-        ON CONFLICT(id) DO NOTHING
+        VALUES (?, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?)
+        ON CONFLICT(modem_id) DO NOTHING
         """,
-        (utc_now(),),
+        (int(modem_id), utc_now()),
     )
 
 
-def _legacy_event_log_metrics(connection: Any, *, start_1h: str, start_24h: str) -> dict[str, Any]:
+def _legacy_event_log_metrics(connection: Any, *, modem_name: str, start_1h: str, start_24h: str) -> dict[str, Any]:
     tx_stats_row = connection.execute(
         """
         SELECT
@@ -498,9 +547,9 @@ def _legacy_event_log_metrics(connection: Any, *, start_1h: str, start_24h: str)
             SUM(CASE WHEN l.event_type = 'strict_filter' AND l.decision = 'rejected' AND l.created_at >= ? THEN 1 ELSE 0 END) AS strict_24h
         FROM digi_flow_event_log l
         JOIN digi_flows f ON f.id = l.flow_id
-        WHERE f.target_kind = 'tx_aprsis'
+        WHERE f.target_kind = 'tx_aprsis' AND f.target_ref = ?
         """,
-        (start_1h, start_24h, start_1h, start_24h, start_1h, start_24h),
+        (start_1h, start_24h, start_1h, start_24h, start_1h, start_24h, modem_name),
     ).fetchone()
     strict_reasons_row = connection.execute(
         """
@@ -537,9 +586,9 @@ def _legacy_event_log_metrics(connection: Any, *, start_1h: str, start_24h: str)
             ) AS malformed_third_party
         FROM digi_flow_event_log l
         JOIN digi_flows f ON f.id = l.flow_id
-        WHERE f.target_kind = 'tx_aprsis'
+        WHERE f.target_kind = 'tx_aprsis' AND f.target_ref = ?
         """,
-        (start_24h, start_24h, start_24h),
+        (start_24h, start_24h, start_24h, modem_name),
     ).fetchone()
     strict_reasons_total_row = connection.execute(
         """
@@ -573,44 +622,48 @@ def _legacy_event_log_metrics(connection: Any, *, start_1h: str, start_24h: str)
             ) AS malformed_third_party_total
         FROM digi_flow_event_log l
         JOIN digi_flows f ON f.id = l.flow_id
-        WHERE f.target_kind = 'tx_aprsis'
-        """
+        WHERE f.target_kind = 'tx_aprsis' AND f.target_ref = ?
+        """,
+        (modem_name,),
     ).fetchone()
     last_tx_row = connection.execute(
         """
         SELECT l.created_at, l.message
         FROM digi_flow_event_log l
         JOIN digi_flows f ON f.id = l.flow_id
-        WHERE f.target_kind = 'tx_aprsis'
+        WHERE f.target_kind = 'tx_aprsis' AND f.target_ref = ?
           AND l.event_type = 'output_action'
           AND l.decision = 'tx'
         ORDER BY l.id DESC
         LIMIT 1
-        """
+        """,
+        (modem_name,),
     ).fetchone()
     last_drop_row = connection.execute(
         """
         SELECT l.created_at, l.message
         FROM digi_flow_event_log l
         JOIN digi_flows f ON f.id = l.flow_id
-        WHERE f.target_kind = 'tx_aprsis'
+        WHERE f.target_kind = 'tx_aprsis' AND f.target_ref = ?
           AND l.event_type = 'output_action'
           AND l.decision = 'drop'
         ORDER BY l.id DESC
         LIMIT 1
-        """
+        """,
+        (modem_name,),
     ).fetchone()
     last_strict_row = connection.execute(
         """
         SELECT l.frame_uid, l.created_at, l.message
         FROM digi_flow_event_log l
         JOIN digi_flows f ON f.id = l.flow_id
-        WHERE f.target_kind = 'tx_aprsis'
+        WHERE f.target_kind = 'tx_aprsis' AND f.target_ref = ?
           AND l.event_type = 'strict_filter'
           AND l.decision = 'rejected'
         ORDER BY l.id DESC
         LIMIT 1
-        """
+        """,
+        (modem_name,),
     ).fetchone()
 
     strict_line = None
@@ -621,13 +674,13 @@ def _legacy_event_log_metrics(connection: Any, *, start_1h: str, start_24h: str)
             SELECT l.message
             FROM digi_flow_event_log l
             JOIN digi_flows f ON f.id = l.flow_id
-            WHERE f.target_kind = 'tx_aprsis'
+            WHERE f.target_kind = 'tx_aprsis' AND f.target_ref = ?
               AND l.frame_uid = ?
               AND l.message LIKE '%| line=%'
             ORDER BY l.id DESC
             LIMIT 1
             """,
-            (strict_frame_uid,),
+            (modem_name, strict_frame_uid),
         ).fetchone()
         strict_line = _extract_line_suffix(_row_value(strict_line_row, "message", ""))
 
@@ -670,10 +723,13 @@ def _legacy_event_log_metrics(connection: Any, *, start_1h: str, start_24h: str)
     }
 
 
-def _backfill_aprsis_minute_stats_from_event_log(connection: Any, *, start_at: str) -> None:
+def _backfill_aprsis_minute_stats_from_event_log(
+    connection: Any, *, modem_id: int, modem_name: str, start_at: str
+) -> None:
     connection.execute(
         """
         INSERT INTO aprsis_uplink_minute_stats (
+            modem_id,
             bucket_minute_utc,
             tx_count,
             drop_count,
@@ -685,6 +741,7 @@ def _backfill_aprsis_minute_stats_from_event_log(connection: Any, *, start_at: s
             updated_at
         )
         SELECT
+            ? AS modem_id,
             strftime('%Y-%m-%dT%H:%M:00+00:00', l.created_at) AS bucket_minute_utc,
             SUM(CASE WHEN l.event_type = 'output_action' AND l.decision = 'tx' THEN 1 ELSE 0 END) AS tx_count,
             SUM(CASE WHEN l.event_type = 'output_action' AND l.decision = 'drop' THEN 1 ELSE 0 END) AS drop_count,
@@ -732,10 +789,10 @@ def _backfill_aprsis_minute_stats_from_event_log(connection: Any, *, start_at: s
             ?
         FROM digi_flow_event_log l
         JOIN digi_flows f ON f.id = l.flow_id
-        WHERE f.target_kind = 'tx_aprsis'
+        WHERE f.target_kind = 'tx_aprsis' AND f.target_ref = ?
           AND l.created_at >= ?
         GROUP BY bucket_minute_utc
-        ON CONFLICT(bucket_minute_utc) DO UPDATE SET
+        ON CONFLICT(modem_id, bucket_minute_utc) DO UPDATE SET
             tx_count = excluded.tx_count,
             drop_count = excluded.drop_count,
             strict_count = excluded.strict_count,
@@ -745,11 +802,12 @@ def _backfill_aprsis_minute_stats_from_event_log(connection: Any, *, start_at: s
             strict_other_count = excluded.strict_other_count,
             updated_at = excluded.updated_at
         """,
-        (utc_now(), start_at),
+        (int(modem_id), utc_now(), modem_name, start_at),
     )
 
 
 def record_aprsis_tx_result(
+    modem_id: int,
     *,
     sent: bool,
     frame_line: str | None,
@@ -759,37 +817,38 @@ def record_aprsis_tx_result(
     normalized_line = _normalize_optional_line(frame_line)
     bucket_minute = _minute_bucket_start(timestamp)
     with get_connection() as connection:
-        _ensure_aprsis_uplink_stats_row(connection)
+        _ensure_aprsis_uplink_stats_row(connection, modem_id)
         if sent:
             connection.execute(
                 """
-                UPDATE aprsis_uplink_stats
+                UPDATE aprsis_connection_stats
                 SET tx_total = tx_total + 1,
                     last_sent_at = ?,
                     last_sent_line = COALESCE(?, last_sent_line),
                     updated_at = ?
-                WHERE id = 1
+                WHERE modem_id = ?
                 """,
-                (timestamp, normalized_line, utc_now()),
+                (timestamp, normalized_line, utc_now(), int(modem_id)),
             )
-            _upsert_aprsis_minute_bucket(connection, bucket_minute_utc=bucket_minute, tx_count=1)
+            _upsert_aprsis_minute_bucket(connection, modem_id=modem_id, bucket_minute_utc=bucket_minute, tx_count=1)
         else:
             connection.execute(
                 """
-                UPDATE aprsis_uplink_stats
+                UPDATE aprsis_connection_stats
                 SET drop_total = drop_total + 1,
                     last_drop_at = ?,
                     last_drop_line = COALESCE(?, last_drop_line),
                     updated_at = ?
-                WHERE id = 1
+                WHERE modem_id = ?
                 """,
-                (timestamp, normalized_line, utc_now()),
+                (timestamp, normalized_line, utc_now(), int(modem_id)),
             )
-            _upsert_aprsis_minute_bucket(connection, bucket_minute_utc=bucket_minute, drop_count=1)
+            _upsert_aprsis_minute_bucket(connection, modem_id=modem_id, bucket_minute_utc=bucket_minute, drop_count=1)
         _prune_aprsis_minute_stats(connection)
 
 
 def record_aprsis_strict_reject(
+    modem_id: int,
     *,
     reason_key: str,
     frame_line: str | None,
@@ -827,17 +886,18 @@ def record_aprsis_strict_reject(
     }
 
     with get_connection() as connection:
-        _ensure_aprsis_uplink_stats_row(connection)
+        _ensure_aprsis_uplink_stats_row(connection, modem_id)
         connection.execute(
             f"""
-            UPDATE aprsis_uplink_stats
+            UPDATE aprsis_connection_stats
             SET {connection_updates}
-            WHERE id = 1
+            WHERE modem_id = ?
             """,
-            (timestamp, normalized_line, normalized_message, utc_now()),
+            (timestamp, normalized_line, normalized_message, utc_now(), int(modem_id)),
         )
         _upsert_aprsis_minute_bucket(
             connection,
+            modem_id=modem_id,
             bucket_minute_utc=bucket_minute,
             strict_count=1,
             **minute_reason_kwargs,
@@ -845,22 +905,26 @@ def record_aprsis_strict_reject(
         _prune_aprsis_minute_stats(connection)
 
 
-def get_aprsis_diagnostics() -> dict[str, Any]:
+def get_aprsis_diagnostics(modem_id: int) -> dict[str, Any]:
     now_ts = datetime.now(timezone.utc)
     start_1h = (now_ts - timedelta(hours=1)).replace(second=0, microsecond=0).isoformat()
     start_24h = (now_ts - timedelta(hours=24)).replace(second=0, microsecond=0).isoformat()
     start_72h = (now_ts - timedelta(hours=_APRSIS_MINUTE_STATS_RETENTION_HOURS)).replace(second=0, microsecond=0).isoformat()
-    runtime = get_aprsis_runtime_status()
+    runtime = get_aprsis_runtime_status(modem_id)
+    interface_row = get_aprsis_interface(modem_id)
+    modem_name = str((interface_row or {}).get("name") or "")
 
     with get_connection() as connection:
-        _ensure_aprsis_uplink_stats_row(connection)
+        _ensure_aprsis_uplink_stats_row(connection, modem_id)
         active_flow_row = connection.execute(
             """
             SELECT COUNT(*) AS total
             FROM digi_flows
             WHERE enabled = 1
               AND target_kind = 'tx_aprsis'
-            """
+              AND target_ref = ?
+            """,
+            (modem_name,),
         ).fetchone()
         active_flows = connection.execute(
             """
@@ -868,15 +932,18 @@ def get_aprsis_diagnostics() -> dict[str, Any]:
             FROM digi_flows
             WHERE enabled = 1
               AND target_kind = 'tx_aprsis'
+              AND target_ref = ?
             ORDER BY updated_at DESC, id DESC
-            """
+            """,
+            (modem_name,),
         ).fetchall()
         stats_row = connection.execute(
             """
             SELECT *
-            FROM aprsis_uplink_stats
-            WHERE id = 1
-            """
+            FROM aprsis_connection_stats
+            WHERE modem_id = ?
+            """,
+            (int(modem_id),),
         ).fetchone()
 
         minute_stats_row = connection.execute(
@@ -893,11 +960,15 @@ def get_aprsis_diagnostics() -> dict[str, Any]:
                 COALESCE(SUM(CASE WHEN bucket_minute_utc >= ? THEN strict_malformed_third_party_count ELSE 0 END), 0) AS strict_malformed_24h,
                 COALESCE(SUM(CASE WHEN bucket_minute_utc >= ? THEN strict_other_count ELSE 0 END), 0) AS strict_other_24h
             FROM aprsis_uplink_minute_stats
+            WHERE modem_id = ?
             """
             ,
-            (start_1h, start_24h, start_1h, start_24h, start_1h, start_24h, start_24h, start_24h, start_24h, start_24h),
+            (start_1h, start_24h, start_1h, start_24h, start_1h, start_24h, start_24h, start_24h, start_24h, start_24h, int(modem_id)),
         ).fetchone()
 
+        # Connect/warning events are logged without a per-connection identifier
+        # (event_logs has no interface column), so this block is deliberately a
+        # global aggregate across every APRS-IS connection, not just this one.
         connect_events_row = connection.execute(
             """
             SELECT
@@ -938,8 +1009,10 @@ def get_aprsis_diagnostics() -> dict[str, Any]:
             and not str(_row_value(stats_row, "last_drop_at", "") or "").strip()
             and not str(_row_value(stats_row, "last_strict_reject_at", "") or "").strip()
         )
-        if minute_window_empty or (stats_total_empty and stats_last_empty):
-            legacy_metrics = _legacy_event_log_metrics(connection, start_1h=start_1h, start_24h=start_24h)
+        if modem_name and (minute_window_empty or (stats_total_empty and stats_last_empty)):
+            legacy_metrics = _legacy_event_log_metrics(
+                connection, modem_name=modem_name, start_1h=start_1h, start_24h=start_24h
+            )
 
         if legacy_metrics is not None and stats_total_empty and stats_last_empty and (
             int(legacy_metrics.get("tx_total") or 0) > 0
@@ -948,7 +1021,7 @@ def get_aprsis_diagnostics() -> dict[str, Any]:
         ):
             connection.execute(
                 """
-                UPDATE aprsis_uplink_stats
+                UPDATE aprsis_connection_stats
                 SET tx_total = ?,
                     drop_total = ?,
                     strict_total = ?,
@@ -964,7 +1037,7 @@ def get_aprsis_diagnostics() -> dict[str, Any]:
                     last_strict_reject_line = ?,
                     last_strict_reject_reason = ?,
                     updated_at = ?
-                WHERE id = 1
+                WHERE modem_id = ?
                 """,
                 (
                     int(legacy_metrics.get("tx_total") or 0),
@@ -982,17 +1055,21 @@ def get_aprsis_diagnostics() -> dict[str, Any]:
                     legacy_metrics.get("last_strict_reject_line"),
                     legacy_metrics.get("last_strict_reject_reason"),
                     utc_now(),
+                    int(modem_id),
                 ),
             )
             stats_row = connection.execute(
                 """
                 SELECT *
-                FROM aprsis_uplink_stats
-                WHERE id = 1
-                """
+                FROM aprsis_connection_stats
+                WHERE modem_id = ?
+                """,
+                (int(modem_id),),
             ).fetchone()
         if legacy_metrics is not None and minute_window_empty:
-            _backfill_aprsis_minute_stats_from_event_log(connection, start_at=start_72h)
+            _backfill_aprsis_minute_stats_from_event_log(
+                connection, modem_id=modem_id, modem_name=modem_name, start_at=start_72h
+            )
             _prune_aprsis_minute_stats(connection)
             minute_stats_row = connection.execute(
                 """
@@ -1008,8 +1085,9 @@ def get_aprsis_diagnostics() -> dict[str, Any]:
                     COALESCE(SUM(CASE WHEN bucket_minute_utc >= ? THEN strict_malformed_third_party_count ELSE 0 END), 0) AS strict_malformed_24h,
                     COALESCE(SUM(CASE WHEN bucket_minute_utc >= ? THEN strict_other_count ELSE 0 END), 0) AS strict_other_24h
                 FROM aprsis_uplink_minute_stats
+                WHERE modem_id = ?
                 """,
-                (start_1h, start_24h, start_1h, start_24h, start_1h, start_24h, start_24h, start_24h, start_24h, start_24h),
+                (start_1h, start_24h, start_1h, start_24h, start_1h, start_24h, start_24h, start_24h, start_24h, start_24h, int(modem_id)),
             ).fetchone()
             minute_window_empty = False
 
@@ -1099,8 +1177,11 @@ def aprsis_runtime_badge(status: str) -> str:
 
 
 class AprsisClientService:
+    """Runs a single APRS-IS connection for one enabled APRSIS-type modem row."""
+
     def __init__(
         self,
+        modem_id: int,
         *,
         poll_interval: float = 1.0,
         reconnect_delay: float = 5.0,
@@ -1108,6 +1189,7 @@ class AprsisClientService:
         frame_consumer: Callable[..., None] | None = None,
         rx_side_effect_queue_max_frames: int = RX_SIDE_EFFECT_QUEUE_MAX_FRAMES,
     ) -> None:
+        self._modem_id = int(modem_id)
         self._poll_interval = poll_interval
         self._reconnect_delay = reconnect_delay
         self._task: asyncio.Task[None] | None = None
@@ -1222,10 +1304,12 @@ class AprsisClientService:
 
     async def _run(self) -> None:
         while not self._stop_event.is_set():
-            rx_interface = get_enabled_aprsis_interface()
+            rx_interface = get_aprsis_interface(self._modem_id)
+            desired_active = rx_interface is not None and bool((rx_interface or {}).get("enabled"))
+            if not desired_active:
+                rx_interface = None
             self._desired_rx_interface = dict(rx_interface) if rx_interface is not None else None
-            desired_active = rx_interface is not None
-            config = get_aprsis_config()
+            config = get_aprsis_config(self._modem_id)
             config_key = (
                 str(config["server"]),
                 int(config["port"]),
@@ -1243,6 +1327,7 @@ class AprsisClientService:
 
             if not config_key[2]:
                 persist_aprsis_runtime_status(
+                    self._modem_id,
                     status=APRSIS_STATUS_ERROR,
                     status_detail="APRS-IS login is empty. Configure My Station callsign or set APRS-IS login override.",
                     server=config_key[0],
@@ -1284,6 +1369,7 @@ class AprsisClientService:
     ) -> None:
         server, port, login, passcode = config_key
         persist_aprsis_runtime_status(
+            self._modem_id,
             status=APRSIS_STATUS_CONNECTING,
             status_detail=f"Connecting to APRS-IS {server}:{port} as {login}.",
             server=server,
@@ -1297,6 +1383,7 @@ class AprsisClientService:
         except (OSError, TimeoutError) as exc:
             error = str(exc).strip() or exc.__class__.__name__
             persist_aprsis_runtime_status(
+                self._modem_id,
                 status=APRSIS_STATUS_ERROR,
                 status_detail=f"APRS-IS connection failed: {error}",
                 server=server,
@@ -1322,6 +1409,7 @@ class AprsisClientService:
             with contextlib.suppress(OSError):
                 await writer.wait_closed()
             persist_aprsis_runtime_status(
+                self._modem_id,
                 status=APRSIS_STATUS_ERROR,
                 status_detail=f"APRS-IS login send failed: {error}",
                 server=server,
@@ -1345,6 +1433,7 @@ class AprsisClientService:
                 name="aprsbox-aprsis-reader",
             )
         persist_aprsis_runtime_status(
+            self._modem_id,
             status=APRSIS_STATUS_CONNECTED,
             status_detail=f"Connected to APRS-IS {server}:{port} as {login}.",
             server=server,
@@ -1421,6 +1510,7 @@ class AprsisClientService:
         if config_key is None:
             if status == APRSIS_STATUS_INACTIVE:
                 persist_aprsis_runtime_status(
+                    self._modem_id,
                     status=APRSIS_STATUS_INACTIVE,
                     status_detail=reason,
                     connected_at=None,
@@ -1430,6 +1520,7 @@ class AprsisClientService:
 
         server, port, login, _passcode = config_key
         persist_aprsis_runtime_status(
+            self._modem_id,
             status=status,
             status_detail=reason,
             server=server,
@@ -1609,3 +1700,201 @@ class AprsisClientService:
                 **side_effect_kwargs,
             )
         return True
+
+
+class AprsisUplinkManagerService:
+    """Supervises one AprsisClientService + AprsIsTxDispatcher pair per enabled
+    APRSIS-type modem row, mirroring TrafficMonitorService's multi-modem
+    supervisor pattern for the RF side."""
+
+    def __init__(
+        self,
+        *,
+        poll_interval: float = 1.0,
+        reconnect_delay: float = 5.0,
+        frame_consumer: Callable[..., None] | None = None,
+        rx_side_effect_queue_max_frames: int = RX_SIDE_EFFECT_QUEUE_MAX_FRAMES,
+    ) -> None:
+        self._poll_interval = poll_interval
+        self._reconnect_delay = reconnect_delay
+        self._frame_consumer = frame_consumer
+        self._rx_side_effect_queue_max_frames = rx_side_effect_queue_max_frames
+        self._lock = Lock()
+        self._task: asyncio.Task[None] | None = None
+        self._stop_event = asyncio.Event()
+        self._runtimes: dict[int, AprsisClientService] = {}
+        self._dispatchers: dict[int, AprsIsTxDispatcher] = {}
+        self._names: dict[int, str] = {}
+
+    def set_frame_consumer(self, frame_consumer: Callable[..., None] | None) -> None:
+        self._frame_consumer = frame_consumer
+        with self._lock:
+            runtimes = list(self._runtimes.values())
+        for runtime in runtimes:
+            runtime.set_frame_consumer(frame_consumer)
+
+    async def start(self) -> None:
+        if self._task is not None:
+            return
+        self._stop_event.clear()
+        self._task = asyncio.create_task(self._run(), name="aprsbox-aprsis-uplink-manager")
+
+    async def stop(self) -> None:
+        self._stop_event.set()
+        task = self._task
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+        with self._lock:
+            runtimes = list(self._runtimes.values())
+            dispatchers = list(self._dispatchers.values())
+            self._runtimes.clear()
+            self._dispatchers.clear()
+            self._names.clear()
+        for dispatcher in dispatchers:
+            await dispatcher.stop()
+        for runtime in runtimes:
+            await runtime.stop()
+
+    async def wait_until_rx_side_effects_idle(self) -> None:
+        with self._lock:
+            runtimes = list(self._runtimes.values())
+        for runtime in runtimes:
+            await runtime.wait_until_rx_side_effects_idle()
+
+    def rx_side_effect_snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            runtimes = list(self._runtimes.values())
+        aggregate: dict[str, Any] = {
+            "current_queue_depth": 0,
+            "queue_capacity": 0,
+            "high_water": 0,
+            "enqueued": 0,
+            "completed": 0,
+            "failed": 0,
+            "dropped_overflow": 0,
+            "rejected_not_running": 0,
+            "running": False,
+            "metrics_ms": {},
+            "stage_breakdown_ms": {},
+            "last_stage_order": [],
+            "radar_breakdown_ms": {},
+        }
+        for runtime in runtimes:
+            snapshot = runtime.rx_side_effect_snapshot()
+            for key in (
+                "current_queue_depth",
+                "queue_capacity",
+                "high_water",
+                "enqueued",
+                "completed",
+                "failed",
+                "dropped_overflow",
+                "rejected_not_running",
+            ):
+                aggregate[key] += int(snapshot.get(key) or 0)
+            aggregate["running"] = aggregate["running"] or bool(snapshot.get("running"))
+            aggregate["metrics_ms"].update(snapshot.get("metrics_ms") or {})
+            aggregate["stage_breakdown_ms"].update(snapshot.get("stage_breakdown_ms") or {})
+            aggregate["radar_breakdown_ms"].update(snapshot.get("radar_breakdown_ms") or {})
+            if snapshot.get("last_stage_order"):
+                aggregate["last_stage_order"] = snapshot["last_stage_order"]
+        return aggregate
+
+    def dispatcher_for_name(self, name: str) -> AprsIsTxDispatcher | None:
+        normalized = str(name or "").strip()
+        if not normalized:
+            return None
+        with self._lock:
+            for modem_id, dispatcher in self._dispatchers.items():
+                if self._names.get(modem_id) == normalized:
+                    return dispatcher
+        return None
+
+    async def wait_until_tx_idle(self) -> None:
+        with self._lock:
+            dispatchers = list(self._dispatchers.values())
+        for dispatcher in dispatchers:
+            await dispatcher.wait_until_idle()
+
+    def dispatchers_latency_snapshot(self) -> dict[str, int]:
+        with self._lock:
+            dispatchers = list(self._dispatchers.values())
+        aggregate = {
+            "current_queue_depth": 0,
+            "queue_capacity": 0,
+            "high_water": 0,
+            "enqueued": 0,
+            "sent": 0,
+            "failed": 0,
+            "dropped_overflow": 0,
+        }
+        for dispatcher in dispatchers:
+            snapshot = dispatcher.latency_snapshot()
+            for key in aggregate:
+                aggregate[key] += int(snapshot.get(key) or 0)
+        return aggregate
+
+    async def _run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                await self._sync_runtimes()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                log_event("WARNING", "aprsis", f"APRS-IS uplink manager loop failed: {exc}. Retrying.")
+            await self._sleep(self._poll_interval)
+
+    async def _sync_runtimes(self) -> None:
+        enabled = list_enabled_aprsis_interfaces()
+        desired_by_id = {int(row["id"]): row for row in enabled}
+        with self._lock:
+            existing_ids = set(self._runtimes)
+        desired_ids = set(desired_by_id)
+
+        for modem_id in existing_ids - desired_ids:
+            await self._stop_runtime(modem_id)
+
+        for modem_id, row in desired_by_id.items():
+            with self._lock:
+                has_runtime = modem_id in self._runtimes
+                if has_runtime:
+                    self._names[modem_id] = str(row.get("name") or "")
+            if has_runtime:
+                continue
+            runtime = AprsisClientService(
+                modem_id,
+                poll_interval=self._poll_interval,
+                reconnect_delay=self._reconnect_delay,
+                frame_consumer=self._frame_consumer,
+                rx_side_effect_queue_max_frames=self._rx_side_effect_queue_max_frames,
+            )
+            dispatcher = AprsIsTxDispatcher(client=runtime)
+            with self._lock:
+                self._runtimes[modem_id] = runtime
+                self._dispatchers[modem_id] = dispatcher
+                self._names[modem_id] = str(row.get("name") or "")
+            await runtime.start()
+            await dispatcher.start()
+
+    async def _stop_runtime(self, modem_id: int) -> None:
+        with self._lock:
+            runtime = self._runtimes.pop(modem_id, None)
+            dispatcher = self._dispatchers.pop(modem_id, None)
+            self._names.pop(modem_id, None)
+        if dispatcher is not None:
+            await dispatcher.stop()
+        if runtime is not None:
+            await runtime.stop()
+        with get_connection() as connection:
+            connection.execute("DELETE FROM aprsis_connection_runtime WHERE modem_id = ?", (int(modem_id),))
+
+    async def _sleep(self, delay: float) -> None:
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=max(delay, 0.05))
+        except TimeoutError:
+            return

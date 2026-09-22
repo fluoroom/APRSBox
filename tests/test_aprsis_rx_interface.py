@@ -13,10 +13,11 @@ from app.db import execute, fetch_all, fetch_one, init_db, set_app_setting, utc_
 from app.services import content
 from app.services.aprsis import (
     AprsisClientService,
-    aprsis_connection_required,
     build_aprsis_login_line,
     get_aprsis_config,
-    get_enabled_aprsis_interface,
+    get_aprsis_interface,
+    list_enabled_aprsis_interfaces,
+    save_aprsis_config,
 )
 from app.services.alarm_groups import save_aprs_alarm_enabled, save_aprs_alarm_groups
 from app.services.content import (
@@ -99,7 +100,7 @@ def create_rf_interface(*, name: str = "Main RF") -> int:
     return int(row["id"])
 
 
-def enable_aprsis_tx_flow() -> None:
+def enable_aprsis_tx_flow(*, target_ref: str = "Internet RX") -> None:
     timestamp = utc_now()
     execute(
         """
@@ -107,9 +108,9 @@ def enable_aprsis_tx_flow() -> None:
             name, description, source_kind, source_ref, target_kind, target_ref,
             enabled, created_at, updated_at
         )
-        VALUES ('RF to IS', '', 'receiver_rf', 'RF', 'tx_aprsis', 'aprsis', 1, ?, ?)
+        VALUES ('RF to IS', '', 'receiver_rf', 'RF', 'tx_aprsis', ?, 1, ?, ?)
         """,
-        (timestamp, timestamp),
+        (target_ref, timestamp, timestamp),
     )
 
 
@@ -117,13 +118,8 @@ POSITION_LINE = "SP5ABC-9>APRS,TCPIP*:!5223.45N/02101.23E>APRS-IS test"
 
 
 class AprsisInterfaceConfigurationTests(unittest.TestCase):
-    def test_new_aprsis_interface_uses_default_filter_and_existing_connection_settings(self) -> None:
+    def test_new_aprsis_interface_uses_default_filter_and_own_connection_settings(self) -> None:
         with temporary_database():
-            set_app_setting("aprsis_server", "example.aprs2.net")
-            set_app_setting("aprsis_port", "10152")
-            set_app_setting("aprsis_login", "SQ9XYZ-10")
-            set_app_setting("aprsis_passcode", "12345")
-
             interface_id = create_aprsis_interface()
             row = fetch_one("SELECT modem_type, device_path FROM modems WHERE id = ?", (interface_id,))
             self.assertIsNotNone(row)
@@ -131,30 +127,45 @@ class AprsisInterfaceConfigurationTests(unittest.TestCase):
             self.assertEqual(row["modem_type"], "APRSIS")
             self.assertEqual(row["device_path"], "m/20")
 
-            interface = get_enabled_aprsis_interface()
-            config = get_aprsis_config()
+            save_aprsis_config(
+                interface_id,
+                {
+                    "server": "example.aprs2.net",
+                    "port": "10152",
+                    "login": "SQ9XYZ-10",
+                    "passcode": "12345",
+                },
+            )
+
+            interface = get_aprsis_interface(interface_id)
+            config = get_aprsis_config(interface_id)
             self.assertEqual((interface or {}).get("filter"), "m/20")
             self.assertEqual(config["server"], "example.aprs2.net")
             self.assertEqual(config["port"], 10152)
             self.assertEqual(config["login"], "SQ9XYZ-10")
             self.assertEqual(config["passcode"], "12345")
 
-    def test_second_aprsis_interface_is_rejected_with_edit_guidance(self) -> None:
+    def test_multiple_aprsis_interfaces_are_allowed_with_independent_settings(self) -> None:
         with temporary_database():
-            create_aprsis_interface(name="First")
-            success, error = safe_create_section_row(
-                "modems",
-                {
-                    "name": "Second",
-                    "modem_type": "APRSIS",
-                    "device_path": "r/52.23/21.01/50",
-                    "enabled": "1",
-                },
-            )
-            self.assertFalse(success)
-            self.assertIn("Edit the existing interface", str(error))
+            first_id = create_aprsis_interface(name="First")
+            second_id = create_aprsis_interface(name="Second")
+            self.assertNotEqual(first_id, second_id)
             count = fetch_one("SELECT COUNT(*) AS total FROM modems WHERE modem_type = 'APRSIS'")
-            self.assertEqual(int((count or {"total": -1})["total"]), 1)
+            self.assertEqual(int((count or {"total": -1})["total"]), 2)
+
+            save_aprsis_config(
+                first_id,
+                {"server": "rotate.aprs2.net", "port": "14580", "login": "SQ9ABC-1", "passcode": "11111"},
+            )
+            save_aprsis_config(
+                second_id,
+                {"server": "noam.aprs2.net", "port": "14580", "login": "SQ9ABC-2", "passcode": "22222"},
+            )
+            first_config = get_aprsis_config(first_id)
+            second_config = get_aprsis_config(second_id)
+            self.assertEqual(first_config["login"], "SQ9ABC-1")
+            self.assertEqual(second_config["login"], "SQ9ABC-2")
+            self.assertNotEqual(first_config["server"], second_config["server"])
 
     def test_login_line_includes_default_aprsis_message_groups(self) -> None:
         with temporary_database():
@@ -228,7 +239,7 @@ class AprsisInterfaceConfigurationTests(unittest.TestCase):
                         "reload": True,
                     },
                 )
-                config = get_aprsis_config()
+                config = get_aprsis_config(int(interface_row["id"]))
                 self.assertEqual(config["server"], "example.aprs2.net")
                 self.assertEqual(config["port"], 10152)
                 self.assertEqual(config["login"], "SQ9XYZ-10")
@@ -246,7 +257,7 @@ class AprsisInterfaceConfigurationTests(unittest.TestCase):
 
 class AprsisReceivePipelineTests(unittest.TestCase):
     def _service(self, interface_id: int) -> AprsisClientService:
-        service = AprsisClientService()
+        service = AprsisClientService(interface_id)
         service._desired_rx_interface = {
             "id": interface_id,
             "name": "Internet RX",
@@ -538,6 +549,7 @@ class AprsisAsyncSideEffectTests(unittest.IsolatedAsyncioTestCase):
         queue_capacity: int = 8,
     ) -> AprsisClientService:
         service = AprsisClientService(
+            9,
             rx_processor=rx_processor,
             frame_consumer=frame_consumer,
             rx_side_effect_queue_max_frames=queue_capacity,
@@ -554,6 +566,7 @@ class AprsisAsyncSideEffectTests(unittest.IsolatedAsyncioTestCase):
             interface_id = create_aprsis_interface()
             digi_frames: list[str] = []
             service = AprsisClientService(
+                interface_id,
                 frame_consumer=lambda line, **_kwargs: digi_frames.append(line),
             )
             service._desired_rx_interface = {
@@ -705,7 +718,7 @@ class AprsisAsyncSideEffectTests(unittest.IsolatedAsyncioTestCase):
     async def test_stage_breakdown_preserves_aprsis_side_effect_order(self) -> None:
         with temporary_database():
             interface_id = create_aprsis_interface()
-            service = AprsisClientService(frame_consumer=lambda *_args, **_kwargs: None)
+            service = AprsisClientService(9, frame_consumer=lambda *_args, **_kwargs: None)
             service._desired_rx_interface = {
                 "id": interface_id,
                 "name": "Internet RX",
@@ -753,7 +766,7 @@ class AprsisAsyncSideEffectTests(unittest.IsolatedAsyncioTestCase):
                     raise RuntimeError("alert observer failed")
                 return original_process_alert_frame(*args, **kwargs)
 
-            service = AprsisClientService(frame_consumer=lambda *_args, **_kwargs: None)
+            service = AprsisClientService(9, frame_consumer=lambda *_args, **_kwargs: None)
             service._desired_rx_interface = {
                 "id": interface_id,
                 "name": "Internet RX",
@@ -948,7 +961,7 @@ class AprsisSharedConnectionTests(unittest.IsolatedAsyncioTestCase):
                 received.append(line)
                 return True
 
-            service = AprsisClientService(rx_processor=rx_processor)
+            service = AprsisClientService(interface_id, rx_processor=rx_processor)
             rx_interface = {"id": interface_id, "name": "Internet RX", "filter": "m/20"}
             service._desired_rx_interface = dict(rx_interface)
             reader = BlockingReader()
@@ -976,7 +989,7 @@ class AprsisSharedConnectionTests(unittest.IsolatedAsyncioTestCase):
         with temporary_database():
             interface_id = create_aprsis_interface()
             enable_aprsis_tx_flow()
-            service = AprsisClientService()
+            service = AprsisClientService(interface_id)
             config_key = ("example.aprs2.net", 14580, "SQ9XYZ-10", "12345")
             service._writer = ExistingWriter()  # type: ignore[assignment]
             service._connected_config = config_key
@@ -990,7 +1003,7 @@ class AprsisSharedConnectionTests(unittest.IsolatedAsyncioTestCase):
             )
 
             execute("UPDATE modems SET enabled = 0 WHERE id = ?", (interface_id,))
-            self.assertFalse(aprsis_connection_required())
+            self.assertEqual(list_enabled_aprsis_interfaces(), [])
             self.assertTrue(
                 service._connection_needs_reconnect(
                     config_key=config_key,

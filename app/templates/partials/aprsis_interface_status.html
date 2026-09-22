@@ -3,7 +3,7 @@
 <div
     class="aprsis-interface-status"
     data-aprsis-interface-status
-    data-diagnostics-url="{{ request.scope.root_path }}/api/igate/diagnostics"
+    data-diagnostics-url="{% if aprsis_modem_id %}{{ request.scope.root_path }}/api/igate/diagnostics?modem_id={{ aprsis_modem_id }}{% endif %}"
     data-static-root="{{ request.scope.root_path }}/static/"
     {% if selected_modem_type != 'APRSIS' %}hidden{% endif %}
 >

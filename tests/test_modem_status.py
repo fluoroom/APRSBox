@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 from app.db import execute, init_db
+from app.services.aprsis import persist_aprsis_runtime_status
 from app.services.content import get_section_row
 
 
@@ -134,7 +135,7 @@ class ModemStatusTests(unittest.TestCase):
             execute(
                 """
                 INSERT INTO digi_flows(name, description, source_kind, source_ref, target_kind, target_ref, enabled, created_at, updated_at)
-                VALUES ('RF to APRS-IS', '', 'receiver_rf', 'TNC', 'tx_aprsis', 'aprsis', 1, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')
+                VALUES ('RF to APRS-IS', '', 'receiver_rf', 'TNC', 'tx_aprsis', 'APRS-IS', 1, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')
                 """
             )
             execute(

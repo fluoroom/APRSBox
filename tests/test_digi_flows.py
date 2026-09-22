@@ -46,7 +46,7 @@ def sample_flow_payload() -> dict:
         "source_kind": "receiver_rf",
         "source_ref": "TNC-1",
         "target_kind": "tx_aprsis",
-        "target_ref": "aprsis",
+        "target_ref": "APRSIS-CONNECTION",
         "enabled": 1,
         "steps": [
             {
@@ -65,7 +65,7 @@ def sample_flow_payload() -> dict:
                 "step_type": "tx_aprsis",
                 "title": "TX APRS-IS",
                 "enabled": 1,
-                "config": {"aprsis_target": "aprsis"},
+                "config": {"aprsis_target": "APRSIS-CONNECTION"},
             },
         ],
     }
@@ -129,7 +129,7 @@ def sample_local_tx_flow_payload(
     *,
     name: str,
     target_kind: str = "tx_aprsis",
-    target_ref: str = "aprsis",
+    target_ref: str = "APRSIS-CONNECTION",
     enabled: int = 1,
 ) -> dict:
     source_step = {
@@ -376,7 +376,7 @@ class DigiFlowsTests(unittest.TestCase):
                         "receiver_rf",
                         "TNC-1",
                         "tx_aprsis",
-                        "aprsis",
+                        "APRSIS-CONNECTION",
                         0,
                         "2026-01-01T00:00:00+00:00",
                         "2026-01-01T00:00:00+00:00",
@@ -389,7 +389,7 @@ class DigiFlowsTests(unittest.TestCase):
                     WHERE source_kind = 'receiver_rf'
                       AND source_ref = 'TNC-1'
                       AND target_kind = 'tx_aprsis'
-                      AND target_ref = 'aprsis'
+                      AND target_ref = 'APRSIS-CONNECTION'
                     """
                 ).fetchone()
                 assert count_row is not None
@@ -464,6 +464,7 @@ class DigiFlowsTests(unittest.TestCase):
         payload = sample_flow_payload()
         payload["steps"] = [payload["steps"][1], payload["steps"][0], payload["steps"][2]]
         with temporary_database():
+            insert_aprsis_interface()
             with self.assertRaisesRegex(ValueError, "First flow step must be a source step"):
                 normalize_digi_flow_payload(payload)
 
@@ -666,7 +667,7 @@ class DigiFlowsTests(unittest.TestCase):
             target_values = {option["value"] for option in options["target"]}
             references = get_digi_flow_reference_options()
             self.assertFalse(any(value.startswith("receiver_aprsis::") for value in source_values))
-            self.assertNotIn("tx_aprsis::aprsis", target_values)
+            self.assertFalse(any(value.startswith("tx_aprsis::") for value in target_values))
             self.assertEqual(references["receiver_aprsis"], [])
             self.assertEqual(references["tx_aprsis"], [])
             with self.assertRaisesRegex(ValueError, "requires a defined APRSIS interface"):
@@ -678,8 +679,8 @@ class DigiFlowsTests(unittest.TestCase):
                 "receiver_aprsis::APRSIS-CONNECTION",
                 {option["value"] for option in options["source"]},
             )
-            self.assertIn("tx_aprsis::aprsis", {option["value"] for option in options["target"]})
-            self.assertEqual(get_digi_flow_reference_options()["tx_aprsis"], ["aprsis"])
+            self.assertIn("tx_aprsis::APRSIS-CONNECTION", {option["value"] for option in options["target"]})
+            self.assertEqual(get_digi_flow_reference_options()["tx_aprsis"], ["APRSIS-CONNECTION"])
 
             payload = sample_flow_payload()
             payload["enabled"] = 0
@@ -766,7 +767,7 @@ class DigiFlowsTests(unittest.TestCase):
                     "source_kind": "receiver_rf",
                     "source_ref": "TNC-1",
                     "target_kind": "tx_aprsis",
-                    "target_ref": "aprsis",
+                    "target_ref": "APRSIS-CONNECTION",
                     "enabled": 1,
                     "steps": [
                         {
@@ -785,7 +786,7 @@ class DigiFlowsTests(unittest.TestCase):
                             "step_type": "tx_aprsis",
                             "title": "TX APRS-IS",
                             "enabled": 1,
-                            "config": {"aprsis_target": "aprsis"},
+                            "config": {"aprsis_target": "APRSIS-CONNECTION"},
                         },
                     ],
                 },
@@ -1372,7 +1373,7 @@ class DigiFlowsTests(unittest.TestCase):
         with temporary_database():
             insert_aprsis_interface()
             aprsis_normalized = normalize_digi_flow_payload(
-                sample_local_tx_flow_payload(name="Local uplink", target_kind="tx_aprsis", target_ref="aprsis")
+                sample_local_tx_flow_payload(name="Local uplink", target_kind="tx_aprsis", target_ref="APRSIS-CONNECTION")
             )
             self.assertEqual(aprsis_normalized["source_kind"], "receiver_local_tx")
             self.assertEqual(aprsis_normalized["target_kind"], "tx_aprsis")
@@ -1471,7 +1472,7 @@ class DigiFlowsTests(unittest.TestCase):
                         "receiver_rf",
                         "TNC-1",
                         "tx_aprsis",
-                        "aprsis",
+                        "APRSIS-CONNECTION",
                         0,
                         "2026-01-01T00:00:00+00:00",
                         "2026-01-01T00:00:00+00:00",
@@ -1512,7 +1513,7 @@ class DigiFlowsTests(unittest.TestCase):
                             "tx_aprsis",
                             "TX APRS-IS",
                             1,
-                            '{"aprsis_target":"aprsis"}',
+                            '{"aprsis_target":"APRSIS-CONNECTION"}',
                             "2026-01-01T00:00:00+00:00",
                             "2026-01-01T00:00:00+00:00",
                         ),
@@ -1542,7 +1543,7 @@ class DigiFlowsTests(unittest.TestCase):
                         "receiver_local_tx",
                         "local_tx",
                         "tx_aprsis",
-                        "aprsis",
+                        "APRSIS-CONNECTION",
                         0,
                         "2026-01-01T00:00:00+00:00",
                         "2026-01-01T00:00:00+00:00",
@@ -1583,7 +1584,7 @@ class DigiFlowsTests(unittest.TestCase):
                             "tx_aprsis",
                             "TX APRS-IS",
                             1,
-                            '{"aprsis_target":"aprsis"}',
+                            '{"aprsis_target":"APRSIS-CONNECTION"}',
                             "2026-01-01T00:00:00+00:00",
                             "2026-01-01T00:00:00+00:00",
                         ),

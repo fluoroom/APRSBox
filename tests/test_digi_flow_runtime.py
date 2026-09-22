@@ -1042,12 +1042,12 @@ class DigiFlowRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     "source_kind": "receiver_rf",
                     "source_ref": "TNC-1",
                     "target_kind": "tx_aprsis",
-                    "target_ref": "aprsis",
+                    "target_ref": "APRSIS-CONNECTION",
                     "enabled": 1,
                     "steps": [
                         {"step_type": "receiver_rf", "title": "Receiver RF", "enabled": 1, "config": {"rf_port": "TNC-1"}},
                         {"step_type": "filter_strict", "title": "Strict Filter", "enabled": 1, "config": {}},
-                        {"step_type": "tx_aprsis", "title": "TX APRS-IS", "enabled": 1, "config": {"aprsis_target": "aprsis"}},
+                        {"step_type": "tx_aprsis", "title": "TX APRS-IS", "enabled": 1, "config": {"aprsis_target": "APRSIS-CONNECTION"}},
                     ],
                 }
             )
@@ -1123,12 +1123,12 @@ class DigiFlowRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     "source_kind": "receiver_rf",
                     "source_ref": "TNC-1",
                     "target_kind": "tx_aprsis",
-                    "target_ref": "aprsis",
+                    "target_ref": "APRSIS-CONNECTION",
                     "enabled": 1,
                     "steps": [
                         {"step_type": "receiver_rf", "title": "Receiver RF", "enabled": 1, "config": {"rf_port": "TNC-1"}},
                         {"step_type": "filter_strict", "title": "Strict Filter", "enabled": 1, "config": {}},
-                        {"step_type": "tx_aprsis", "title": "TX APRS-IS", "enabled": 1, "config": {"aprsis_target": "aprsis"}},
+                        {"step_type": "tx_aprsis", "title": "TX APRS-IS", "enabled": 1, "config": {"aprsis_target": "APRSIS-CONNECTION"}},
                     ],
                 }
             )
@@ -1172,7 +1172,7 @@ class DigiFlowRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_routing_queue_is_bounded_and_fails_closed(self) -> None:
         with temporary_database():
             set_local_station_identity()
-            insert_aprsis_interface()
+            aprsis_modem_id = insert_aprsis_interface()
             create_flow(
                 {
                     "name": "Bounded APRSIS queue",
@@ -1180,12 +1180,12 @@ class DigiFlowRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     "source_kind": "receiver_rf",
                     "source_ref": "TNC-1",
                     "target_kind": "tx_aprsis",
-                    "target_ref": "aprsis",
+                    "target_ref": "APRSIS-CONNECTION",
                     "enabled": 1,
                     "steps": [
                         {"step_type": "receiver_rf", "title": "Receiver RF", "enabled": 1, "config": {"rf_port": "TNC-1"}},
                         {"step_type": "filter_strict", "title": "Strict Filter", "enabled": 1, "config": {}},
-                        {"step_type": "tx_aprsis", "title": "TX APRS-IS", "enabled": 1, "config": {"aprsis_target": "aprsis"}},
+                        {"step_type": "tx_aprsis", "title": "TX APRS-IS", "enabled": 1, "config": {"aprsis_target": "APRSIS-CONNECTION"}},
                     ],
                 }
             )
@@ -1205,7 +1205,9 @@ class DigiFlowRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(second["accepted"])
             self.assertEqual(second["drop_reason"], "routing_queue_full")
             self.assertEqual(second["queue_depth"], 1)
-            diagnostics_row = fetch_one("SELECT drop_total FROM aprsis_uplink_stats WHERE id = 1")
+            diagnostics_row = fetch_one(
+                "SELECT drop_total FROM aprsis_connection_stats WHERE modem_id = ?", (aprsis_modem_id,)
+            )
             self.assertIsNotNone(diagnostics_row)
             assert diagnostics_row is not None
             self.assertEqual(int(diagnostics_row["drop_total"]), 1)
@@ -1242,12 +1244,12 @@ class DigiFlowRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     "source_kind": "receiver_local_tx",
                     "source_ref": "local_tx",
                     "target_kind": "tx_aprsis",
-                    "target_ref": "aprsis",
+                    "target_ref": "APRSIS-CONNECTION",
                     "enabled": 1,
                     "steps": [
                         {"step_type": "receiver_local_tx", "title": "Local TX", "enabled": 1, "config": {"local_tx_source": "local_tx"}},
                         {"step_type": "filter_strict", "title": "Strict Filter", "enabled": 1, "config": {}},
-                        {"step_type": "tx_aprsis", "title": "TX APRS-IS", "enabled": 1, "config": {"aprsis_target": "aprsis"}},
+                        {"step_type": "tx_aprsis", "title": "TX APRS-IS", "enabled": 1, "config": {"aprsis_target": "APRSIS-CONNECTION"}},
                     ],
                 }
             )
@@ -1359,12 +1361,12 @@ class DigiFlowRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     "source_kind": "receiver_local_tx",
                     "source_ref": "local_tx",
                     "target_kind": "tx_aprsis",
-                    "target_ref": "aprsis",
+                    "target_ref": "APRSIS-CONNECTION",
                     "enabled": 1,
                     "steps": [
                         {"step_type": "receiver_local_tx", "title": "Local TX", "enabled": 1, "config": {"local_tx_source": "local_tx"}},
                         {"step_type": "filter_strict", "title": "Strict Filter", "enabled": 1, "config": {}},
-                        {"step_type": "tx_aprsis", "title": "TX APRS-IS", "enabled": 1, "config": {"aprsis_target": "aprsis"}},
+                        {"step_type": "tx_aprsis", "title": "TX APRS-IS", "enabled": 1, "config": {"aprsis_target": "APRSIS-CONNECTION"}},
                     ],
                 }
             )
@@ -2728,11 +2730,11 @@ class DigiFlowRuntimeTests(unittest.IsolatedAsyncioTestCase):
                     "source_kind": "receiver_rf",
                     "source_ref": "TNC-1",
                     "target_kind": "tx_aprsis",
-                    "target_ref": "aprsis",
+                    "target_ref": "APRSIS-CONNECTION",
                     "enabled": 1,
                     "steps": [
                         {"step_type": "receiver_rf", "title": "Receiver RF", "enabled": 1, "config": {"rf_port": "TNC-1"}},
-                        {"step_type": "tx_aprsis", "title": "TX APRS-IS", "enabled": 1, "config": {"aprsis_target": "aprsis"}},
+                        {"step_type": "tx_aprsis", "title": "TX APRS-IS", "enabled": 1, "config": {"aprsis_target": "APRSIS-CONNECTION"}},
                     ],
                 }
             )

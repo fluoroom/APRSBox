@@ -21,6 +21,7 @@ from app.services.aprsis import (
     APRSIS_STRICT_REASON_MALFORMED_THIRD_PARTY,
     APRSIS_STRICT_REASON_OTHER,
     AprsisClientService,
+    AprsisUplinkManagerService,
     record_aprsis_strict_reject,
     record_aprsis_tx_result,
 )
@@ -188,7 +189,7 @@ class DigiFlowRuntimeService:
         self,
         *,
         poll_interval: float = 0.5,
-        aprsis_client: AprsisClientService | None = None,
+        aprsis_client: AprsisClientService | AprsisUplinkManagerService | None = None,
         aprsis_tx_dispatcher: AprsIsTxDispatcher | None = None,
         rf_tx_dispatcher: Any | None = None,
         trace_writer: DigiFlowTraceWriter | None = None,
@@ -199,9 +200,18 @@ class DigiFlowRuntimeService:
     ) -> None:
         self._poll_interval = poll_interval
         self._aprsis_client = aprsis_client
-        self._owns_aprsis_tx_dispatcher = aprsis_tx_dispatcher is None and aprsis_client is not None
+        # A manager (AprsisUplinkManagerService) owns one dispatcher per APRS-IS
+        # connection and starts/stops them itself; only a legacy/test caller
+        # passing a single AprsisClientService directly gets a dispatcher built
+        # and owned here.
+        self._aprsis_client_is_manager = aprsis_client is not None and hasattr(aprsis_client, "dispatcher_for_name")
+        self._owns_aprsis_tx_dispatcher = (
+            aprsis_tx_dispatcher is None and aprsis_client is not None and not self._aprsis_client_is_manager
+        )
         self._aprsis_tx_dispatcher = aprsis_tx_dispatcher or (
-            AprsIsTxDispatcher(client=aprsis_client) if aprsis_client is not None else None
+            AprsIsTxDispatcher(client=aprsis_client)
+            if aprsis_client is not None and not self._aprsis_client_is_manager
+            else None
         )
         self._rf_tx_dispatcher = rf_tx_dispatcher
         self._owns_trace_writer = trace_writer is None
@@ -283,7 +293,9 @@ class DigiFlowRuntimeService:
             },
             "rf_tx_dispatcher": dispatcher_snapshot,
             "aprsis_tx_dispatcher": (
-                self._aprsis_tx_dispatcher.latency_snapshot()
+                self._aprsis_client.dispatchers_latency_snapshot()
+                if self._aprsis_client_is_manager
+                else self._aprsis_tx_dispatcher.latency_snapshot()
                 if self._aprsis_tx_dispatcher is not None
                 else {
                     "current_queue_depth": 0,
@@ -444,7 +456,9 @@ class DigiFlowRuntimeService:
             if pending <= 0 and not self._aprsis_rf_pending:
                 break
             await asyncio.sleep(0.01)
-        if self._aprsis_tx_dispatcher is not None:
+        if self._aprsis_client_is_manager:
+            await self._aprsis_client.wait_until_tx_idle()
+        elif self._aprsis_tx_dispatcher is not None:
             await self._aprsis_tx_dispatcher.wait_until_idle()
         await self._trace_writer.wait_until_idle()
 
@@ -499,11 +513,14 @@ class DigiFlowRuntimeService:
                     source_kind=str(superseded["source_kind"]),
                     source_ref=str(superseded["source_ref"]),
                 )
-                if any(
-                    str(flow.get("target_kind") or "").strip() == "tx_aprsis"
-                    for flow in matching_old_flows
-                ):
+                for old_flow in matching_old_flows:
+                    if str(old_flow.get("target_kind") or "").strip() != "tx_aprsis":
+                        continue
+                    superseded_modem_id = _aprsis_modem_id_for_name(str(old_flow.get("target_ref") or ""))
+                    if superseded_modem_id is None:
+                        continue
                     record_aprsis_tx_result(
+                        superseded_modem_id,
                         sent=False,
                         frame_line=str(superseded["raw_payload"]),
                     )
@@ -529,12 +546,13 @@ class DigiFlowRuntimeService:
                 source_kind=str(frame["source_kind"]),
                 source_ref=str(frame["source_ref"]),
             )
-            aprsis_targeted = any(
-                str(flow.get("target_kind") or "").strip() == "tx_aprsis"
-                for flow in matching_flows
-            )
-            if aprsis_targeted:
-                record_aprsis_tx_result(sent=False, frame_line=str(frame["raw_payload"]))
+            for matched_flow in matching_flows:
+                if str(matched_flow.get("target_kind") or "").strip() != "tx_aprsis":
+                    continue
+                dropped_modem_id = _aprsis_modem_id_for_name(str(matched_flow.get("target_ref") or ""))
+                if dropped_modem_id is None:
+                    continue
+                record_aprsis_tx_result(dropped_modem_id, sent=False, frame_line=str(frame["raw_payload"]))
             log_event(
                 "WARNING",
                 "digi_flow_runtime",
@@ -1801,6 +1819,11 @@ class DigiFlowRuntimeService:
         flow_id = int(context["flow"]["id"])
         step_id = int(step["id"])
         is_aprsis_target = str((context.get("flow") or {}).get("target_kind") or "").strip() == "tx_aprsis"
+        aprsis_target_modem_id = (
+            _aprsis_modem_id_for_name(str((context.get("flow") or {}).get("target_ref") or ""))
+            if is_aprsis_target
+            else None
+        )
         if parsed is None:
             message = _t("Strict filter rejected frame because TNC2 parsing failed.")
             self._log_digi_flow_event(
@@ -1811,8 +1834,9 @@ class DigiFlowRuntimeService:
                 decision="rejected",
                 message=message,
             )
-            if is_aprsis_target:
+            if is_aprsis_target and aprsis_target_modem_id is not None:
                 record_aprsis_strict_reject(
+                    aprsis_target_modem_id,
                     reason_key=APRSIS_STRICT_REASON_OTHER,
                     frame_line=str(context.get("current_line") or ""),
                     reason_message=message,
@@ -1830,8 +1854,9 @@ class DigiFlowRuntimeService:
                 decision="rejected",
                 message=message,
             )
-            if is_aprsis_target:
+            if is_aprsis_target and aprsis_target_modem_id is not None:
                 record_aprsis_strict_reject(
+                    aprsis_target_modem_id,
                     reason_key=reason_key,
                     frame_line=str(context.get("current_line") or ""),
                     reason_message=message,
@@ -1869,8 +1894,9 @@ class DigiFlowRuntimeService:
             decision="rejected",
             message=message,
         )
-        if is_aprsis_target:
+        if is_aprsis_target and aprsis_target_modem_id is not None:
             record_aprsis_strict_reject(
+                aprsis_target_modem_id,
                 reason_key=_strict_reject_reason_key(blocked_token),
                 frame_line=str(context.get("current_line") or ""),
                 reason_message=message,
@@ -2742,6 +2768,23 @@ class DigiFlowRuntimeService:
         step_id = int(step["id"])
         now_monotonic = time.monotonic()
         metadata = dict(context.get("metadata") or {})
+
+        target_ref = str((context.get("flow") or {}).get("target_ref") or "").strip()
+        target_modem_id = _aprsis_modem_id_for_name(target_ref)
+        if target_modem_id is None:
+            message = _t(
+                "APRS-IS TX rejected frame because the target APRS-IS connection "
+                f"'{target_ref or '?'}' is missing or disabled."
+            )
+            self._log_digi_flow_event(
+                frame_uid=context["frame_uid"],
+                flow_id=flow_id,
+                step_id=step_id,
+                event_type="output_action",
+                decision="drop",
+                message=message,
+            )
+            return {"decision": "drop"}
         if str(context.get("source_kind") or "") == LOCAL_TX_SOURCE_KIND:
             created_at = _parse_utc_datetime(metadata.get("local_tx_created_at"))
             try:
@@ -2769,6 +2812,7 @@ class DigiFlowRuntimeService:
                         message=message,
                     )
                     record_aprsis_tx_result(
+                        target_modem_id,
                         sent=False,
                         frame_line=str(context.get("current_line") or ""),
                     )
@@ -2799,7 +2843,7 @@ class DigiFlowRuntimeService:
                 decision="drop",
                 message=message,
             )
-            record_aprsis_tx_result(sent=False, frame_line=str(context.get("current_line") or ""))
+            record_aprsis_tx_result(target_modem_id, sent=False, frame_line=str(context.get("current_line") or ""))
             return {"decision": "drop"}
         parsed = context.get("parsed")
         if parsed is None:
@@ -2812,7 +2856,7 @@ class DigiFlowRuntimeService:
                 decision="drop",
                 message=message,
             )
-            record_aprsis_tx_result(sent=False, frame_line=str(context.get("current_line") or ""))
+            record_aprsis_tx_result(target_modem_id, sent=False, frame_line=str(context.get("current_line") or ""))
             return {"decision": "drop"}
 
         local_igate = _station_identity_for_modem(str(context.get("source_ref") or ""))
@@ -2826,7 +2870,7 @@ class DigiFlowRuntimeService:
                 decision="drop",
                 message=message,
             )
-            record_aprsis_tx_result(sent=False, frame_line=str(context.get("current_line") or ""))
+            record_aprsis_tx_result(target_modem_id, sent=False, frame_line=str(context.get("current_line") or ""))
             return {"decision": "drop"}
 
         source_kind = str(context.get("source_kind") or "")
@@ -2867,10 +2911,15 @@ class DigiFlowRuntimeService:
                 decision="drop",
                 message=message,
             )
-            record_aprsis_tx_result(sent=False, frame_line=str(context.get("current_line") or ""))
+            record_aprsis_tx_result(target_modem_id, sent=False, frame_line=str(context.get("current_line") or ""))
             return {"decision": "drop"}
 
-        if self._aprsis_tx_dispatcher is None:
+        dispatcher = (
+            self._aprsis_client.dispatcher_for_name(target_ref)
+            if self._aprsis_client_is_manager
+            else self._aprsis_tx_dispatcher
+        )
+        if dispatcher is None:
             message = _t("APRS-IS TX rejected frame because APRS-IS uplink runtime is unavailable.")
             self._log_digi_flow_event(
                 frame_uid=context["frame_uid"],
@@ -2880,7 +2929,7 @@ class DigiFlowRuntimeService:
                 decision="drop",
                 message=message,
             )
-            record_aprsis_tx_result(sent=False, frame_line=str(context.get("current_line") or ""))
+            record_aprsis_tx_result(target_modem_id, sent=False, frame_line=str(context.get("current_line") or ""))
             return {"decision": "drop"}
 
         rx_to_igate_enqueue_ms = _monotonic_delta_ms(
@@ -2914,7 +2963,7 @@ class DigiFlowRuntimeService:
                     line=tx_line,
                     source_kind=APRSIS_SOURCE_KIND,
                 )
-            await asyncio.to_thread(record_aprsis_tx_result, sent=sent, frame_line=tx_line)
+            await asyncio.to_thread(record_aprsis_tx_result, target_modem_id, sent=sent, frame_line=tx_line)
             if not sent:
                 self._log_digi_flow_event(
                     frame_uid=context["frame_uid"],
@@ -2926,7 +2975,7 @@ class DigiFlowRuntimeService:
                 )
 
         aprsis_decision_monotonic = time.monotonic()
-        success, detail = self._aprsis_tx_dispatcher.enqueue(
+        success, detail = dispatcher.enqueue(
             line=tx_line,
             telemetry=tx_telemetry,
             on_result=on_result,
@@ -3432,6 +3481,20 @@ def _local_station_identity() -> str:
 
 def _local_station_identities() -> dict[str, str]:
     return dict(get_digi_flow_routing_snapshot().local_station_identities)
+
+
+def _aprsis_modem_id_for_name(modem_name: str) -> int | None:
+    """Resolve an APRS-IS connection's modem_id from its name (digi_flows.source_ref/target_ref)."""
+    normalized = str(modem_name or "").strip()
+    if not normalized:
+        return None
+    modem = get_digi_flow_routing_snapshot().modems_by_name.get(normalized)
+    if modem is None:
+        return None
+    try:
+        return int(modem["id"])
+    except (KeyError, TypeError, ValueError):
+        return None
 
 
 def _station_identity_for_modem(modem_name: str) -> str:
