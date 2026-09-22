@@ -31,11 +31,16 @@ def is_rf_source(source_kind: Any) -> bool:
 
 
 def normalize_aprsis_filter(value: Any) -> str:
+    """Normalize an APRS-IS server filter.
+
+    An empty result is the upload-only mode: no ``filter`` clause is sent, so a
+    user-defined filter port subscribes the connection to nothing.
+    """
     filter_text = str(value or "").strip()
     if filter_text.lower().startswith("filter "):
         filter_text = filter_text[7:].strip()
     if not filter_text:
-        return DEFAULT_APRSIS_FILTER
+        return ""
     if len(filter_text) > 512:
         raise ValueError("APRS-IS filter must be 512 characters or fewer.")
     if any(char in "\r\n" or ord(char) < 32 or ord(char) > 126 for char in filter_text):

@@ -13,6 +13,7 @@ from app.db import execute, fetch_all, fetch_one, init_db, set_app_setting, utc_
 from app.services import content
 from app.services.aprsis import (
     AprsisClientService,
+    aprsis_downlink_enabled,
     build_aprsis_login_line,
     get_aprsis_config,
     get_aprsis_interface,
@@ -64,7 +65,7 @@ def temporary_database() -> Path:
                 os.environ["APRSBOX_DB_PATH"] = previous
 
 
-def create_aprsis_interface(*, name: str = "Internet RX", server_filter: str = "", enabled: bool = True) -> int:
+def create_aprsis_interface(*, name: str = "Internet RX", server_filter: str = "m/20", enabled: bool = True) -> int:
     success, error = safe_create_section_row(
         "modems",
         {
@@ -144,6 +145,41 @@ class AprsisInterfaceConfigurationTests(unittest.TestCase):
             self.assertEqual(config["port"], 10152)
             self.assertEqual(config["login"], "SQ9XYZ-10")
             self.assertEqual(config["passcode"], "12345")
+
+    def test_blank_filter_keeps_interface_upload_only(self) -> None:
+        with temporary_database():
+            save_aprs_alarm_enabled(True)
+            save_aprs_alarm_groups("PL-WARN")
+            interface_id = create_aprsis_interface(server_filter="   ")
+            row = fetch_one("SELECT device_path FROM modems WHERE id = ?", (interface_id,))
+            assert row is not None
+            self.assertEqual(row["device_path"], "")
+
+            interface = get_aprsis_interface(interface_id)
+            assert interface is not None
+            self.assertEqual(interface["filter"], "")
+            self.assertEqual(interface["effective_filter"], "")
+            self.assertFalse(aprsis_downlink_enabled(interface))
+
+            line = build_aprsis_login_line(login="SQ9XYZ-10", passcode="12345", server_filter="")
+            self.assertNotIn("filter", line)
+
+    def test_upload_only_interface_drops_every_received_line(self) -> None:
+        with temporary_database():
+            interface_id = create_aprsis_interface(server_filter="")
+            received: list[str] = []
+
+            def rx_processor(line: str, **_context: object) -> bool:
+                received.append(line)
+                return True
+
+            service = AprsisClientService(interface_id, rx_processor=rx_processor)
+            service._desired_rx_interface = dict(get_aprsis_interface(interface_id) or {})
+            self.assertFalse(service._process_server_line(POSITION_LINE))
+            self.assertFalse(
+                service._process_server_line("SP5ABC-9>APRS,TCPIP*::SQ9XYZ-10:hello{1")
+            )
+            self.assertEqual(received, [])
 
     def test_multiple_aprsis_interfaces_are_allowed_with_independent_settings(self) -> None:
         with temporary_database():

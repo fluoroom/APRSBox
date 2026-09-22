@@ -2078,5 +2078,6 @@
   "mDNS name": "mDNS name",
   "Local mDNS resolve": "Local mDNS resolve",
   "Web UI URL": "Web UI URL",
-  "Inactive": "Inactive"
+  "Inactive": "Inactive",
+  "Leave empty for upload only: nothing is received from APRS-IS, not even alarm or message groups.": "chImmoH: APRS-IS Doch Hev pagh, alarm group je message group je Hev pagh."
 }

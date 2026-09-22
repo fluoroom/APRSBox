@@ -2080,5 +2080,6 @@
   "mDNS name": "Nombre mDNS",
   "Local mDNS resolve": "Resolución mDNS local",
   "Web UI URL": "URL de la interfaz web",
-  "Inactive": "Inactivo"
+  "Inactive": "Inactivo",
+  "Leave empty for upload only: nothing is received from APRS-IS, not even alarm or message groups.": "Déjalo vacío para solo subida: no se recibe nada de APRS-IS, ni siquiera grupos de alarma o de mensajes."
 }

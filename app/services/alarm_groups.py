@@ -308,12 +308,11 @@ def build_automatic_aprsis_alarm_filter(groups: Any | None = None) -> str:
 
 def build_effective_aprsis_filter(user_filter: Any, groups: Any | None = None) -> str:
     """Append missing alarm and message-group subscriptions to the user's filter."""
-    raw_user_filter = str(user_filter or "").strip()
-    normalized_user_filter = (
-        normalize_aprsis_filter(raw_user_filter)
-        if raw_user_filter
-        else ""
-    )
+    normalized_user_filter = normalize_aprsis_filter(user_filter)
+    if not normalized_user_filter:
+        # Upload-only interface: subscribing it to alarm or message groups
+        # would reopen the downlink the empty filter switched off.
+        return ""
     normalized_alarm_groups = (
         (
             get_aprs_alarm_groups()

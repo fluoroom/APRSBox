@@ -21,7 +21,7 @@ Disabling an interface stops its receive processing. Disabling a radio interface
 
 For OpenWebRX MQTT, the address field should be an `mqtt://` or `mqtts://` URL with the topic in the path, for example `mqtt://user:pass@127.0.0.1:1883/openwebrx/aprs`.
 
-For APRSIS, `APRS-IS receive filter` is the APRS-IS server filter. New interfaces default to `m/20`; another valid filter such as `r/52.23/21.01/50` can be entered. Server, port, login, and passcode are saved from the same form. The separate `iGATE settings` tab is no longer used.
+For APRSIS, `APRS-IS receive filter` is the APRS-IS server filter. New interfaces default to `m/20`; another valid filter such as `r/52.23/21.01/50` can be entered. Leaving the field empty makes the interface upload only: no `filter` clause is sent, no alarm or message groups are subscribed automatically, and every line arriving from the server is discarded, including messages addressed to the login. Server, port, login, and passcode are saved from the same form. The separate `iGATE settings` tab is no longer used.
 
 ## Configuration fields
 
@@ -41,7 +41,7 @@ The APRSIS interface form also contains:
 - `Server` and `Port` — the APRS-IS server address, defaulting to `rotate.aprs2.net:14580`.
 - `Login callsign / callsign-SSID` — may be left blank to use the identity from `My Station`.
 - `Passcode` — may be left blank so APRSBox derives the standard APRS-IS passcode from the login callsign.
-- `APRS-IS receive filter` — controls traffic received from the server but does not restrict frames sent by `Packet Routing`.
+- `APRS-IS receive filter` — controls traffic received from the server but does not restrict frames sent by `Packet Routing`. Empty means upload only.
 
 Below the APRSIS form, the current connection state and expandable diagnostics show active flows, the last error, and TX counters. An APRS-IS passcode is not an account password; it is the standard code derived from a callsign.
 

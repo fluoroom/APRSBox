@@ -21,7 +21,7 @@ Desactivar una interfaz detiene su recepción. Desactivar una interfaz de radio 
 
 Para OpenWebRX MQTT, el campo de dirección debe ser una URL `mqtt://` o `mqtts://` con el topic en la ruta, por ejemplo `mqtt://user:pass@127.0.0.1:1883/openwebrx/aprs`.
 
-Para APRSIS, `Filtro de recepción APRS-IS` es el filtro del servidor APRS-IS. Las interfaces nuevas usan `m/20` por defecto; se puede introducir otro filtro válido como `r/52.23/21.01/50`. El servidor, el puerto, el login y el passcode se guardan desde el mismo formulario. La pestaña separada `Ajustes iGATE` ya no se usa.
+Para APRSIS, `Filtro de recepción APRS-IS` es el filtro del servidor APRS-IS. Las interfaces nuevas usan `m/20` por defecto; se puede introducir otro filtro válido como `r/52.23/21.01/50`. Si el campo se deja vacío, la interfaz queda en modo solo subida: no se envía ninguna cláusula `filter`, no se suscribe automáticamente ningún grupo de alarma o de mensajes y se descarta cada línea que llega del servidor, incluidos los mensajes dirigidos al propio login. El servidor, el puerto, el login y el passcode se guardan desde el mismo formulario. La pestaña separada `Ajustes iGATE` ya no se usa.
 
 ## Campos de configuración
 
@@ -41,7 +41,7 @@ El formulario de la interfaz APRSIS también contiene:
 - `Servidor` y `Puerto` — la dirección del servidor APRS-IS, por defecto `rotate.aprs2.net:14580`.
 - `Indicativo de inicio de sesión / indicativo-SSID` — puede dejarse vacío para usar la identidad de `Mi estación`.
 - `Código de acceso` — puede dejarse vacío para que APRSBox derive el passcode APRS-IS estándar del indicativo de login.
-- `Filtro de recepción APRS-IS` — controla el tráfico recibido del servidor, pero no limita las tramas enviadas por `Packet Routing`.
+- `Filtro de recepción APRS-IS` — controla el tráfico recibido del servidor, pero no limita las tramas enviadas por `Packet Routing`. Vacío significa solo subida.
 
 Debajo del formulario APRSIS, el estado actual de la conexión y el diagnóstico desplegable muestran los flows activos, el último error y los contadores TX. Un passcode APRS-IS no es una contraseña de cuenta, sino el código estándar derivado del indicativo.
 

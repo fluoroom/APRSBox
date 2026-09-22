@@ -17,7 +17,7 @@ from app.services.rx_side_effect_dispatcher import (
     RX_SIDE_EFFECT_QUEUE_MAX_FRAMES,
     RxSideEffectDispatcher,
 )
-from app.services.traffic_source import DEFAULT_APRSIS_FILTER, normalize_aprsis_filter
+from app.services.traffic_source import normalize_aprsis_filter
 
 DEFAULT_APRSIS_SERVER = "rotate.aprs2.net"
 DEFAULT_APRSIS_PORT = 14580
@@ -265,10 +265,18 @@ def _decorate_aprsis_interface_row(row: Any) -> dict[str, Any]:
     try:
         result["filter"] = normalize_aprsis_filter(result.get("device_path"))
     except ValueError as exc:
-        result["filter"] = DEFAULT_APRSIS_FILTER
-        log_event("WARNING", "aprsis", f"Invalid stored APRS-IS filter; using {DEFAULT_APRSIS_FILTER}: {exc}")
+        # An unusable filter must not fall back to a broad subscription.
+        result["filter"] = ""
+        log_event("WARNING", "aprsis", f"Invalid stored APRS-IS filter; downlink disabled: {exc}")
     result["effective_filter"] = build_effective_aprsis_filter(result["filter"])
     return result
+
+
+def aprsis_downlink_enabled(rx_interface: Any) -> bool:
+    """An APRSIS interface without a server filter is upload-only."""
+    if not rx_interface:
+        return False
+    return bool(str(rx_interface.get("filter") or "").strip())
 
 
 def list_enabled_aprsis_interfaces() -> list[dict[str, Any]]:
@@ -1610,6 +1618,11 @@ class AprsisClientService:
 
         rx_interface = self._desired_rx_interface
         if rx_interface is None:
+            return False
+        if not aprsis_downlink_enabled(rx_interface):
+            # A user-defined filter port still pushes messages addressed to the
+            # login, so the downlink is closed here instead of relying on the
+            # server-side filter alone.
             return False
         try:
             interface_id = int(rx_interface["id"])

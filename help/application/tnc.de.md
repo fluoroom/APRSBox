@@ -21,7 +21,7 @@ Das Deaktivieren einer Schnittstelle stoppt ihren Empfang. Bei einer Funkschnitt
 
 Für OpenWebRX MQTT sollte das Adressfeld eine `mqtt://`- oder `mqtts://`-URL mit Topic im Pfad sein, zum Beispiel `mqtt://user:pass@127.0.0.1:1883/openwebrx/aprs`.
 
-Für APRSIS ist `APRS-IS-Empfangsfilter` der APRS-IS-Serverfilter. Neue Schnittstellen verwenden standardmäßig `m/20`; ein anderer gültiger Filter wie `r/52.23/21.01/50` kann eingegeben werden. Server, Port, Login und Passcode werden im selben Formular gespeichert. Der separate Tab `iGATE-Einstellungen` wird nicht mehr verwendet.
+Für APRSIS ist `APRS-IS-Empfangsfilter` der APRS-IS-Serverfilter. Neue Schnittstellen verwenden standardmäßig `m/20`; ein anderer gültiger Filter wie `r/52.23/21.01/50` kann eingegeben werden. Bleibt das Feld leer, arbeitet die Schnittstelle als reiner Upload: Es wird keine `filter`-Klausel gesendet, keine Alarm- oder Nachrichtengruppen werden automatisch abonniert, und jede vom Server eintreffende Zeile wird verworfen, auch Nachrichten an das eigene Login. Server, Port, Login und Passcode werden im selben Formular gespeichert. Der separate Tab `iGATE-Einstellungen` wird nicht mehr verwendet.
 
 ## Konfigurationsfelder
 
@@ -41,7 +41,7 @@ Das APRSIS-Schnittstellenformular enthält außerdem:
 - `Server` und `Port` — die APRS-IS-Serveradresse, standardmäßig `rotate.aprs2.net:14580`.
 - `Login-Rufzeichen / Rufzeichen-SSID` — kann leer bleiben, um die Identität aus `Meine Station` zu verwenden.
 - `Passcode` — kann leer bleiben, damit APRSBox den standardmäßigen APRS-IS-Passcode aus dem Login-Rufzeichen ableitet.
-- `APRS-IS-Empfangsfilter` — steuert den vom Server empfangenen Verkehr, beschränkt jedoch nicht die von `Packet Routing` gesendeten Frames.
+- `APRS-IS-Empfangsfilter` — steuert den vom Server empfangenen Verkehr, beschränkt jedoch nicht die von `Packet Routing` gesendeten Frames. Leer bedeutet reiner Upload.
 
 Unter dem APRSIS-Formular zeigen der aktuelle Verbindungsstatus und die aufklappbare Diagnose aktive Flows, den letzten Fehler und TX-Zähler. Ein APRS-IS-Passcode ist kein Kontopasswort, sondern der aus dem Rufzeichen abgeleitete Standardcode.
 

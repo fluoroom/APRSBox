@@ -3,7 +3,8 @@
 {% set stored_device_path = modem_values.get('device_path') or '' %}
 {% set tnc_device_path = stored_device_path if selected_modem_type in ['SERIALL', 'TCP'] else '' %}
 {% set openwebrx_device_path = stored_device_path if selected_modem_type == 'OPENWEBRX_MQTT' else '' %}
-{% set aprsis_receive_filter = stored_device_path if selected_modem_type == 'APRSIS' else 'm/20' %}
+{# Only a stored/submitted APRSIS row may show an empty (upload-only) filter; a brand new one starts from the default. #}
+{% set aprsis_receive_filter = stored_device_path if selected_modem_type == 'APRSIS' and 'device_path' in modem_values else 'm/20' %}
 {% macro rx_silence_reconnect_field() -%}
 <label>
     <span>{{ t("RX Silence Reconnect Timeout (s)") }}</span>
@@ -185,7 +186,8 @@
             </label>
             <label class="full">
                 <span>{{ t("APRS-IS receive filter") }}</span>
-                <input type="text" name="device_path" value="{{ aprsis_receive_filter }}" placeholder="m/20" required>
+                <input type="text" name="device_path" value="{{ aprsis_receive_filter }}" placeholder="m/20">
+                <small class="muted">{{ t("Leave empty for upload only: nothing is received from APRS-IS, not even alarm or message groups.") }}</small>
             </label>
         </div>
     </fieldset>

@@ -21,7 +21,7 @@ Wyłączenie interfejsu zatrzymuje jego odbiór. Wyłączenie interfejsu radiowe
 
 Dla OpenWebRX MQTT pole adresu powinno być URL-em `mqtt://` albo `mqtts://` z tematem w ścieżce, na przykład `mqtt://user:pass@127.0.0.1:1883/openwebrx/aprs`.
 
-Dla APRSIS pole `Filtr odbioru APRS-IS` jest filtrem serwera APRS-IS. Nowy interfejs otrzymuje domyślnie `m/20`; można wpisać inny poprawny filtr, na przykład `r/52.23/21.01/50`. Serwer, port, login i passcode są zapisywane z tego samego formularza. Osobna zakładka `Ustawienia iGATE` nie jest już używana.
+Dla APRSIS pole `Filtr odbioru APRS-IS` jest filtrem serwera APRS-IS. Nowy interfejs otrzymuje domyślnie `m/20`; można wpisać inny poprawny filtr, na przykład `r/52.23/21.01/50`. Pozostawienie pustego pola przełącza interfejs w tryb tylko wysyłania: klauzula `filter` nie jest wysyłana, żadne grupy alarmowe ani wiadomości nie są subskrybowane automatycznie, a każda linia odebrana z serwera jest odrzucana, łącznie z wiadomościami adresowanymi do własnego loginu. Serwer, port, login i passcode są zapisywane z tego samego formularza. Osobna zakładka `Ustawienia iGATE` nie jest już używana.
 
 ## Pola konfiguracji
 
@@ -41,7 +41,7 @@ Dla interfejsu APRSIS formularz zawiera dodatkowo:
 - `Server` i `Port` — adres serwera APRS-IS, domyślnie `rotate.aprs2.net:14580`.
 - `Login callsign / callsign-SSID` — może pozostać pusty, aby użyć znaku z `My Station`.
 - `Passcode` — może pozostać pusty, aby APRSBox wyliczał standardowy passcode APRS-IS ze znaku logowania.
-- `Filtr odbioru APRS-IS` — steruje ruchem odbieranym z serwera, ale nie ogranicza ramek wysyłanych przez `Packet Routing`.
+- `Filtr odbioru APRS-IS` — steruje ruchem odbieranym z serwera, ale nie ogranicza ramek wysyłanych przez `Packet Routing`. Puste pole oznacza tryb tylko wysyłania.
 
 Pod formularzem APRSIS znajduje się stan bieżącego połączenia i rozwijana diagnostyka z aktywnymi flow, ostatnim błędem oraz licznikami TX. Passcode APRS-IS nie jest hasłem do konta; jest standardowym kodem wyliczanym ze znaku.
 
