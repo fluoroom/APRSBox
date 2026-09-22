@@ -8,6 +8,7 @@ from app.db import connection_scope, execute, fetch_all, log_event, set_app_sett
 from app.services.activation_schedule import compute_activation_state
 from app.services.content import get_station_settings, station_has_tx_target
 from app.services.outbound import enqueue_object_job, latest_object_dispatch_at
+from app.services.stations import get_primary_station, get_station, has_stations, station_settings_from_station
 
 
 OBJECT_LAST_ENQUEUED_KEY_PREFIX = "scheduler.object.last_enqueued_at."
@@ -47,10 +48,6 @@ class ObjectSchedulerService:
             self._tick_scoped()
 
     def _tick_scoped(self) -> None:
-        station_settings = get_station_settings()
-        if not station_settings or not station_settings.get("callsign") or not station_has_tx_target(station_settings):
-            return
-
         now = datetime.now(timezone.utc)
         due_objects = []
         for row in fetch_all(
@@ -60,7 +57,7 @@ class ObjectSchedulerService:
                    activation_mode, active_from_utc, active_until_utc, first_activation_utc,
                    recurrence_duration_minutes, recurrence_interval_value, recurrence_interval_unit, recurrence_until_utc,
                    latitude, longitude, symbol_table, symbol_code, symbol_overlay, path, comment,
-                   objects.updated_at, scheduler_setting.value AS last_enqueued_at
+                   objects.station_id, objects.updated_at, scheduler_setting.value AS last_enqueued_at
             FROM aprs_objects AS objects
             LEFT JOIN app_settings AS scheduler_setting
               ON scheduler_setting.key = ? || objects.id
@@ -87,6 +84,9 @@ class ObjectSchedulerService:
 
         cursor = latest_object_dispatch_at()
         for obj in due_objects:
+            station_settings = _resolve_station_settings_for_entity(obj)
+            if not station_settings or not station_settings.get("callsign") or not station_has_tx_target(station_settings):
+                continue
             scheduled_for = now
             if cursor is not None:
                 scheduled_for = max(now, cursor + timedelta(seconds=random.randint(*self._jitter_seconds)))
@@ -113,6 +113,26 @@ def _parse_timestamp(value: str | None) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _resolve_station_settings_for_entity(entity: dict) -> dict | None:
+    """Return station_settings for an object/item: use entity.station_id if set, else primary/legacy."""
+    station_id = entity.get("station_id")
+    if station_id is not None:
+        try:
+            sid = int(station_id)
+        except (TypeError, ValueError):
+            sid = None
+        if sid is not None:
+            station = get_station(sid)
+            if station:
+                return station_settings_from_station(station)
+    if has_stations():
+        primary = get_primary_station()
+        if primary:
+            return station_settings_from_station(primary)
+        return None
+    return get_station_settings()
 
 
 def _disable_expired_object(object_id: int, valid_until_utc: str) -> None:

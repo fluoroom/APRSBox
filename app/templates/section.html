@@ -12,7 +12,7 @@
 
 {% block content %}
 {% set delete_confirm_message = 'Delete this object?' if section.slug == 'objects' else ('Delete this item?' if section.slug == 'items' else ('Delete this bulletin?' if section.slug == 'bulletins' else 'Delete this record?')) %}
-{% if section.slug not in ['objects', 'items', 'modems', 'bulletins'] %}
+{% if section.slug not in ['objects', 'items', 'modems', 'bulletins', 'stations-config'] %}
 <section class="panel">
     <div class="panel-body">
         <div class="panel-header">
@@ -28,7 +28,7 @@
 </section>
 {% endif %}
 
-<section class="grid two">
+<section class="{% if section.slug == 'stations-config' %}stations-config-layout{% else %}grid two{% endif %}">
     <div class="panel">
         <div class="panel-body">
             <div class="panel-header">
@@ -37,7 +37,40 @@
                 </div>
             </div>
             <div class="table-wrap">
-                {% if section.slug in ['objects', 'items'] %}
+                {% if section.slug == 'stations-config' %}
+                <table class="data-table compact-table">
+                    <thead>
+                        <tr>
+                            <th>{{ t("Station") }}</th>
+                            <th>{{ t("Callsign") }}</th>
+                            <th>{{ t("Enabled") }}</th>
+                            {% if can_edit and section.supports_delete %}
+                            <th>{{ t("Actions") }}</th>
+                            {% endif %}
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for row in rows %}
+                        <tr {% if can_edit and section.supports_editing %}class="clickable-row" data-href="?edit={{ row.id }}"{% endif %}>
+                            <td>{{ row.name }}</td>
+                            <td><code>{{ row.callsign or '-' }}{% if row.ssid %}-{{ row.ssid }}{% endif %}</code></td>
+                            <td>{{ t('Yes' if row.enabled else 'No') }}</td>
+                            {% if can_edit and section.supports_delete %}
+                            <td>
+                                <form method="post" action="{{ request.scope.root_path }}/settings/stations-config/{{ row.id }}/delete" class="table-action-form" onclick="event.stopPropagation();" onsubmit="event.stopPropagation(); return confirm({{ t('Delete this station?')|tojson }});">
+                                    <button type="submit" class="table-icon-button table-icon-button-danger" title="{{ t('Delete station') }}" aria-label="{{ t('Delete station') }} {{ row.name }}">
+                                        <img src="{{ request.scope.root_path }}/static/icons/delete-outline.svg" alt="">
+                                    </button>
+                                </form>
+                            </td>
+                            {% endif %}
+                        </tr>
+                        {% else %}
+                        <tr><td colspan="{{ 4 if can_edit and section.supports_delete else 3 }}">{{ t("No stations yet. Add one below.") }}</td></tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+                {% elif section.slug in ['objects', 'items'] %}
                 <table class="data-table prepared-entity-table">
                     <thead>
                         <tr>
@@ -124,7 +157,8 @@
                     <thead>
                         <tr>
                             {% for field in section.fields %}
-                            {% if section.slug == 'modems' and field.name in ['band', 'modem_type', 'device_path', 'baud_rate', 'serial_rx_silence_reconnect_seconds', 'tx_min_gap_seconds', 'expose_allow_tx', 'expose_bind_address', 'expose_port', 'expose_whitelist'] %}
+                            {% if field.list_visible is false %}
+                            {% elif section.slug == 'modems' and field.name in ['band', 'modem_type', 'device_path', 'baud_rate', 'serial_rx_silence_reconnect_seconds', 'tx_min_gap_seconds', 'expose_allow_tx', 'expose_bind_address', 'expose_port', 'expose_whitelist'] %}
                             {% elif section.slug == 'modems' and field.name == 'enabled' %}
                             <th>{{ t("Status") }}</th>
                             {% elif section.slug == 'modems' and field.name == 'tx_blocked' %}
@@ -147,7 +181,8 @@
                         {% for row in rows %}
                         <tr {% if can_edit and section.supports_editing %}class="clickable-row" data-href="?edit={{ row.id }}"{% endif %}>
                             {% for field in section.fields %}
-                            {% if section.slug == 'modems' and field.name in ['band', 'modem_type', 'device_path', 'baud_rate', 'serial_rx_silence_reconnect_seconds', 'tx_min_gap_seconds', 'expose_allow_tx', 'expose_bind_address', 'expose_port', 'expose_whitelist'] %}
+                            {% if field.list_visible is false %}
+                            {% elif section.slug == 'modems' and field.name in ['band', 'modem_type', 'device_path', 'baud_rate', 'serial_rx_silence_reconnect_seconds', 'tx_min_gap_seconds', 'expose_allow_tx', 'expose_bind_address', 'expose_port', 'expose_whitelist'] %}
                             {% elif section.slug == 'modems' and field.name == 'enabled' %}
                             <td class="modems-summary-icon-cell">
                                 <span
@@ -284,7 +319,7 @@
                 {% endif %}
             </div>
             {% if can_edit %}
-            {% if section.slug in ['objects', 'items', 'modems', 'bulletins'] and flash %}
+            {% if section.slug in ['objects', 'items', 'modems', 'bulletins', 'stations-config'] and flash %}
             <div class="alert {% if flash_success %}success{% endif %}">{{ t(flash) }}</div>
             {% endif %}
             <form method="post" class="form-grid" id="{{ section.slug }}-form"{% if section.slug == 'modems' %} data-interface-save-action{% elif section.slug == 'objects' %} data-object-modal-action{% elif section.slug == 'bulletins' %} data-bulletin-modal-action{% endif %}>
@@ -414,6 +449,20 @@
                             </div>
                         </div>
                     </div>
+                    {% elif field.type == 'station_select' %}
+                    <span>{{ t(field.label) }}</span>
+                    <select name="{{ field.name }}">
+                        {% for option in (station_select_options if station_select_options is defined else []) %}
+                        <option value="{{ option.value }}" {% if (edit_row and edit_row[field.name]|string == option.value|string) %}selected{% elif (not edit_row and option.value == '') %}selected{% endif %}>{{ t(option.label) }}</option>
+                        {% endfor %}
+                    </select>
+                    {% elif field.type == 'interface_select' %}
+                    <span>{{ t(field.label) }}</span>
+                    <select name="{{ field.name }}">
+                        {% for option in (interface_select_options if interface_select_options is defined else []) %}
+                        <option value="{{ option.value }}" {% if (edit_row and edit_row[field.name]|string == option.value|string) %}selected{% elif (not edit_row and option.value == '') %}selected{% endif %}>{{ t(option.label) }}</option>
+                        {% endfor %}
+                    </select>
                     {% else %}
                     <span>{{ t(field.label) }}</span>
                     {% if section.slug in ['objects', 'items', 'bulletins'] and field.name == 'recurrence_duration_minutes' %}

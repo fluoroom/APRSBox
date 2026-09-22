@@ -57,6 +57,9 @@ _APRSIS_RF_TRANSLITERATIONS = str.maketrans(
 )
 
 
+_STATION_TX_SCOPE_ALL_FOR_STATION = "all_active_for_station"
+
+
 def _list_active_tnc_modems() -> list[dict[str, Any]]:
     rows = fetch_all(
         """
@@ -66,6 +69,21 @@ def _list_active_tnc_modems() -> list[dict[str, Any]]:
           AND modem_type IN ('TCP', 'SERIALL', 'SERIAL')
         ORDER BY name COLLATE NOCASE ASC, id ASC
         """
+    )
+    return [dict(row) for row in rows]
+
+
+def _list_active_tnc_modems_for_station(station_id: int) -> list[dict[str, Any]]:
+    rows = fetch_all(
+        """
+        SELECT id, name, modem_type, band, device_path, enabled
+        FROM modems
+        WHERE station_id = ?
+          AND enabled = 1
+          AND modem_type IN ('TCP', 'SERIALL', 'SERIAL')
+        ORDER BY name COLLATE NOCASE ASC, id ASC
+        """,
+        (station_id,),
     )
     return [dict(row) for row in rows]
 
@@ -99,6 +117,20 @@ def _resolve_station_target_modems(
                 "internal_tx_only": True,
             }
         ], None
+
+    scope_raw = str(station_settings.get("beacon_tx_scope") or "").strip().lower()
+
+    # Station-scoped: use only modems belonging to this station
+    station_id = station_settings.get("station_id")
+    if scope_raw == _STATION_TX_SCOPE_ALL_FOR_STATION and station_id is not None:
+        try:
+            sid = int(station_id)
+        except (TypeError, ValueError):
+            return None, "Station ID is invalid."
+        modems = _list_active_tnc_modems_for_station(sid)
+        if not modems:
+            return None, "No active RF interfaces are configured for this station."
+        return modems, None
 
     scope = normalize_tx_scope(station_settings.get("beacon_tx_scope"), default=TX_SCOPE_SINGLE)
     if scope == TX_SCOPE_ALL_ACTIVE:

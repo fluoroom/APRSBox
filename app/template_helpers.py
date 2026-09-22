@@ -15,6 +15,7 @@ from app.services.band_condition import is_band_condition_enabled
 from app.services.content import get_aprs_symbol_icon_fallback_path, get_aprs_symbol_set
 from app.services.map_service import get_map_page_config
 from app.services.messages import get_unread_inbox_count
+from app.services.stations import list_stations
 
 
 PRIMARY_NAV = [
@@ -27,7 +28,7 @@ PRIMARY_NAV = [
     {"key": "statistics", "label": "Statistics", "href": "/statistics", "roles": ("admin", "operator", "viewer"), "icon": "chart-bar-stacked.svg"},
     {"key": "nav-separator-primary", "separator": True, "roles": ("admin", "operator"), "visible_roles": ("viewer",)},
     {"key": "modems", "label": "Interfaces", "href": "/settings/modems", "roles": ("admin", "operator", "viewer"), "icon": "radio-handheld.svg"},
-    {"key": "station", "label": "My Station", "href": "/station", "roles": ("admin", "operator"), "visible_roles": ("viewer",), "icon": "antenna.svg"},
+    {"key": "stations-config", "label": "My Stations", "href": "/settings/stations-config", "roles": ("admin", "operator"), "visible_roles": ("viewer",), "icon": "antenna.svg"},
     {"key": "wx", "label": "WX", "href": "/wx", "roles": ("admin", "operator"), "visible_roles": ("viewer",), "icon": "weather-partly-snowy.svg"},
     {"key": "messages", "label": "Messages", "href": "/messages", "roles": ("admin", "operator"), "visible_roles": ("viewer",), "icon": "message-reply-text-outline.svg"},
     {"key": "notifications", "label": "Notifications", "href": "/notifications", "roles": ("admin", "operator"), "visible_roles": ("viewer",), "icon": "bell-outline.svg"},
@@ -157,6 +158,19 @@ def _build_template_context_scoped(
                     translated_item["attention_count"] = current_alert_count
                     translated_item["has_attention"] = current_alert_count > 0
             navigation.append(translated_item)
+            if item["key"] == "stations-config" and current_user:
+                for station in list_stations():
+                    station_id = station.get("id")
+                    label = str(station.get("name") or "").strip() or f"Station {station_id}"
+                    navigation.append({
+                        "key": f"station-{station_id}",
+                        "label": label,
+                        "href": f"/station/{station_id}",
+                        "roles": ("admin", "operator"),
+                        "visible_roles": ("viewer",),
+                        "icon": "antenna.svg",
+                        "disabled": current_user.role not in ("admin", "operator"),
+                    })
 
     return {
         "request": request,

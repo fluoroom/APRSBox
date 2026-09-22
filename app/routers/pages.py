@@ -85,6 +85,13 @@ from app.services.content import (
 )
 from app.services.tx_scope import ALL_ACTIVE_INTERFACE_OPTION_VALUE, INTERNAL_TX_INTERFACE_OPTION_VALUE
 from app.services.mqtt_url import OPENWEBRX_MQTT_MODEM_TYPE, mask_mqtt_url
+from app.services.stations import (
+    create_station,
+    delete_station,
+    get_station,
+    station_settings_from_station,
+    update_station,
+)
 from app.services.alarm_groups import (
     APRS_ALARM_LEVEL_THRESHOLDS,
     build_automatic_aprsis_alarm_filter,
@@ -512,6 +519,24 @@ def _section_template_context_scoped(
         context["section_tx_log_rows"] = recent_object_outbound_jobs(limit=20)
     elif slug == "bulletins":
         context["section_tx_log_rows"] = recent_bulletin_outbound_jobs(limit=20)
+    # Populate station/interface dropdowns for sections that use these field types
+    _STATION_SELECT_SLUGS = {"modems", "objects", "items", "bulletins", "stations"}
+    _INTERFACE_SELECT_SLUGS = {"stations"}
+    if slug in _STATION_SELECT_SLUGS:
+        from app.services.stations import list_station_options as _list_station_options
+        context["station_select_options"] = [{"value": "", "label": "None / Any station"}] + [
+            {
+                "value": str(s["id"]),
+                "label": f"{s['name']} ({s['callsign']}-{s['ssid']})" if s.get("ssid") else f"{s['name']} ({s['callsign']})",
+            }
+            for s in _list_station_options()
+        ]
+    if slug in _INTERFACE_SELECT_SLUGS:
+        from app.services.content import get_active_tnc_interfaces as _get_active_tnc_interfaces
+        context["interface_select_options"] = [{"value": "", "label": "None / Any interface"}] + [
+            {"value": str(m["id"]), "label": f"{m['name']} ({m.get('modem_type', '-')})"}
+            for m in _get_active_tnc_interfaces()
+        ]
     return context
 
 
@@ -1469,6 +1494,7 @@ def modems_create(
     aprsis_port: str = Form(""),
     aprsis_login: str = Form(""),
     aprsis_passcode: str = Form(""),
+    station_id: str = Form(""),
 ) -> object:
     templates = request.app.state.templates
     wants_json = request.headers.get("x-requested-with", "").lower() == "xmlhttprequest"
@@ -1481,6 +1507,7 @@ def modems_create(
             )
         return templates.TemplateResponse("section.html", context, status_code=status.HTTP_400_BAD_REQUEST)
 
+    station_id_value: int | None = int(station_id) if station_id.strip() else None
     normalized_modem_type = modem_type.strip().upper()
     if normalized_modem_type == "SERIAL":
         normalized_modem_type = "SERIALL"
@@ -1510,6 +1537,7 @@ def modems_create(
         "expose_bind_address": expose_bind_address.strip(),
         "expose_port": expose_port,
         "expose_whitelist": expose_whitelist,
+        "station_id": station_id_value,
     }
     aprsis_form_data = {
         "aprsis_server": aprsis_server,
@@ -1626,6 +1654,97 @@ def modems_toggle(
         )
     return RedirectResponse(
         url=_path(request, "/settings/modems?flash=Interface%20status%20updated.&success=1"),
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@router.get("/settings/stations-config")
+def stations_config_page(
+    request: Request,
+    current_user: UserIdentity = Depends(get_current_user),
+    edit: int | None = None,
+    flash: str | None = None,
+    success: int = 0,
+) -> object:
+    templates = request.app.state.templates
+    edit_row = get_section_row("stations", edit) if edit is not None else None
+    return templates.TemplateResponse(
+        "section.html",
+        _section_template_context(
+            request,
+            current_user,
+            "stations",
+            edit_row=edit_row,
+            flash=flash,
+            flash_success=bool(success),
+        ),
+    )
+
+
+@router.post("/settings/stations-config")
+def stations_config_create(
+    request: Request,
+    current_user: UserIdentity = Depends(require_roles("admin", "operator")),
+    record_id: int | None = Form(None),
+    name: str = Form(...),
+    callsign: str = Form(""),
+    ssid: str = Form(""),
+    enabled: str | None = Form(None),
+) -> object:
+    templates = request.app.state.templates
+    wants_json = request.headers.get("x-requested-with", "").lower() == "xmlhttprequest"
+
+    def error_response(message: str, context: dict[str, Any]) -> object:
+        if wants_json:
+            return JSONResponse(
+                {"ok": False, "error": _translate(message)},
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+        return templates.TemplateResponse("section.html", context, status_code=status.HTTP_400_BAD_REQUEST)
+
+    payload = {
+        "name": name,
+        "callsign": callsign,
+        "ssid": ssid,
+        "enabled": 1 if enabled is not None else 0,
+    }
+
+    if record_id is None:
+        ok, message, new_id = create_station(payload)
+    else:
+        ok, message = update_station(record_id, payload)
+
+    if not ok:
+        edit_row = get_section_row("stations", record_id) if record_id is not None else None
+        context = _section_template_context(
+            request, current_user, "stations", flash=message, edit_row=edit_row
+        )
+        return error_response(message, context)
+
+    if wants_json:
+        return JSONResponse({"ok": True, "message": _translate(message), "reload": True})
+
+    redirect_id = record_id if record_id is not None else (new_id if record_id is None else None)
+    if redirect_id is not None:
+        return RedirectResponse(
+            url=_path(request, f"/settings/stations-config?edit={redirect_id}&flash={quote(message)}&success=1"),
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    return RedirectResponse(
+        url=_path(request, f"/settings/stations-config?flash={quote(message)}&success=1"),
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@router.post("/settings/stations-config/{record_id}/delete")
+def stations_config_delete(
+    record_id: int,
+    request: Request,
+    current_user: UserIdentity = Depends(require_roles("admin", "operator")),
+) -> RedirectResponse:
+    delete_station(record_id)
+    return RedirectResponse(
+        url=_path(request, "/settings/stations-config"),
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -3338,6 +3457,27 @@ def station_page(
     return templates.TemplateResponse("station.html", context)
 
 
+@router.get("/station/{station_id}")
+def station_detail_config_page(
+    station_id: int,
+    request: Request,
+    current_user: UserIdentity = Depends(require_roles("admin", "operator")),
+) -> object:
+    templates = request.app.state.templates
+    station_row = get_station(station_id)
+    if station_row is None:
+        return RedirectResponse(
+            url=_path(request, "/settings/stations-config"),
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    adapted = station_settings_from_station(station_row)
+    context = _station_page_context(request, current_user, station=adapted)
+    context["active_nav"] = f"station-{station_id}"
+    context["page_title"] = str(station_row.get("name") or f"Station {station_id}")
+    context["editing_station_id"] = station_id
+    return templates.TemplateResponse("station.html", context)
+
+
 @router.get("/map")
 @_scoped_read_model
 def map_page(
@@ -4259,6 +4399,240 @@ def station_send_status(
         )
     context = _station_page_context(request, current_user, flash=flash, flash_success=success, station=station_settings)
     return templates.TemplateResponse("station.html", context, status_code=200 if success else status.HTTP_400_BAD_REQUEST)
+
+
+def _station_form_to_station_payload(
+    *,
+    callsign: str,
+    ssid: str,
+    beacon_interface_id: str,
+    beacon_comment: str,
+    beacon_interval_minutes: str,
+    beacon_interval_mode: str,
+    beacon_interval_minutes_fixed: str,
+    beacon_path: str,
+    status_enabled: str | None,
+    status_text: str,
+    status_interval_minutes: str,
+    latitude: str,
+    longitude: str,
+    symbol_table: str,
+    symbol_code: str,
+    symbol_overlay: str,
+    tx_enabled: str | None,
+) -> dict[str, Any]:
+    mode = beacon_interval_mode.strip().lower() or BEACON_INTERVAL_MODE_FIXED
+    interval_source = beacon_interval_minutes_fixed if mode == BEACON_INTERVAL_MODE_FIXED else beacon_interval_minutes
+    raw_iface = beacon_interface_id.strip()
+    if raw_iface in ("", "__ALL_ACTIVE__", "__INTERNAL_TX__"):
+        beacon_iface: int | None = None
+        tx_scope = "all_active_for_station"
+    elif raw_iface.isdigit():
+        beacon_iface = int(raw_iface)
+        tx_scope = "single"
+    else:
+        beacon_iface = None
+        tx_scope = "all_active_for_station"
+    return {
+        "callsign": callsign.strip(),
+        "ssid": ssid.strip(),
+        "beacon_comment": beacon_comment.strip(),
+        "beacon_interval_mode": mode,
+        "beacon_interval_minutes": interval_source.strip(),
+        "beacon_path": beacon_path.strip(),
+        "beacon_tx_scope": tx_scope,
+        "beacon_interface_id": beacon_iface,
+        "status_enabled": 1 if status_enabled else 0,
+        "status_text": status_text.strip(),
+        "status_interval_minutes": status_interval_minutes.strip(),
+        "latitude": latitude.strip(),
+        "longitude": longitude.strip(),
+        "symbol_table": symbol_table.strip(),
+        "symbol_code": symbol_code.strip(),
+        "symbol_overlay": symbol_overlay.strip(),
+        "tx_enabled": 1 if tx_enabled else 0,
+    }
+
+
+def _station_scoped_response(
+    request: Request,
+    current_user: UserIdentity,
+    station_id: int,
+    *,
+    ok: bool,
+    message: str,
+    wants_json: bool,
+    fallback_payload: dict[str, Any] | None = None,
+) -> object:
+    templates = request.app.state.templates
+    if wants_json:
+        if ok:
+            return JSONResponse({"ok": True, "message": _translate(message), "reload": True})
+        return JSONResponse(
+            {"ok": False, "error": _translate(message)},
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+    updated = get_station(station_id) if ok else None
+    adapted = station_settings_from_station(updated) if updated else fallback_payload
+    context = _station_page_context(
+        request, current_user, flash=message, flash_success=ok, station=adapted
+    )
+    context["active_nav"] = f"station-{station_id}"
+    context["editing_station_id"] = station_id
+    return templates.TemplateResponse(
+        "station.html",
+        context,
+        status_code=200 if ok else status.HTTP_400_BAD_REQUEST,
+    )
+
+
+@router.post("/station/{station_id}")
+def station_detail_update(
+    station_id: int,
+    request: Request,
+    current_user: UserIdentity = Depends(require_roles("admin", "operator")),
+    callsign: str = Form(""),
+    ssid: str = Form(""),
+    beacon_interface_id: str = Form(""),
+    beacon_comment: str = Form(""),
+    beacon_interval_minutes: str = Form("30"),
+    beacon_interval_mode: str = Form(BEACON_INTERVAL_MODE_FIXED),
+    beacon_interval_minutes_fixed: str = Form("30"),
+    beacon_path: str = Form(""),
+    status_enabled: str | None = Form(None),
+    status_text: str = Form(""),
+    status_interval_minutes: str = Form("30"),
+    latitude: str = Form(""),
+    longitude: str = Form(""),
+    symbol_table: str = Form("/"),
+    symbol_code: str = Form(">"),
+    symbol_overlay: str = Form(""),
+    tx_enabled: str | None = Form(None),
+) -> object:
+    wants_json = request.headers.get("x-requested-with", "").lower() == "xmlhttprequest"
+    payload = _station_form_to_station_payload(
+        callsign=callsign, ssid=ssid, beacon_interface_id=beacon_interface_id,
+        beacon_comment=beacon_comment, beacon_interval_minutes=beacon_interval_minutes,
+        beacon_interval_mode=beacon_interval_mode,
+        beacon_interval_minutes_fixed=beacon_interval_minutes_fixed,
+        beacon_path=beacon_path, status_enabled=status_enabled, status_text=status_text,
+        status_interval_minutes=status_interval_minutes, latitude=latitude, longitude=longitude,
+        symbol_table=symbol_table, symbol_code=symbol_code, symbol_overlay=symbol_overlay,
+        tx_enabled=tx_enabled,
+    )
+    ok, message = update_station(station_id, payload)
+    return _station_scoped_response(
+        request, current_user, station_id,
+        ok=ok, message=message, wants_json=wants_json, fallback_payload=payload,
+    )
+
+
+@router.post("/station/{station_id}/send-beacon")
+def station_detail_send_beacon(
+    station_id: int,
+    request: Request,
+    current_user: UserIdentity = Depends(require_roles("admin", "operator")),
+    callsign: str = Form(""),
+    ssid: str = Form(""),
+    beacon_interface_id: str = Form(""),
+    beacon_comment: str = Form(""),
+    beacon_interval_minutes: str = Form("30"),
+    beacon_interval_mode: str = Form(BEACON_INTERVAL_MODE_FIXED),
+    beacon_interval_minutes_fixed: str = Form("30"),
+    beacon_path: str = Form(""),
+    status_enabled: str | None = Form(None),
+    status_text: str = Form(""),
+    status_interval_minutes: str = Form("30"),
+    latitude: str = Form(""),
+    longitude: str = Form(""),
+    symbol_table: str = Form("/"),
+    symbol_code: str = Form(">"),
+    symbol_overlay: str = Form(""),
+    tx_enabled: str | None = Form(None),
+) -> object:
+    wants_json = request.headers.get("x-requested-with", "").lower() == "xmlhttprequest"
+    payload = _station_form_to_station_payload(
+        callsign=callsign, ssid=ssid, beacon_interface_id=beacon_interface_id,
+        beacon_comment=beacon_comment, beacon_interval_minutes=beacon_interval_minutes,
+        beacon_interval_mode=beacon_interval_mode,
+        beacon_interval_minutes_fixed=beacon_interval_minutes_fixed,
+        beacon_path=beacon_path, status_enabled=status_enabled, status_text=status_text,
+        status_interval_minutes=status_interval_minutes, latitude=latitude, longitude=longitude,
+        symbol_table=symbol_table, symbol_code=symbol_code, symbol_overlay=symbol_overlay,
+        tx_enabled=tx_enabled,
+    )
+    ok, message = update_station(station_id, payload)
+    if ok:
+        station_row = get_station(station_id)
+        if station_row is not None:
+            adapted = station_settings_from_station(station_row)
+            ok, message = enqueue_beacon_job(adapted)
+    return _station_scoped_response(
+        request, current_user, station_id,
+        ok=ok, message=message, wants_json=wants_json, fallback_payload=payload,
+    )
+
+
+@router.post("/station/{station_id}/send-status")
+def station_detail_send_status(
+    station_id: int,
+    request: Request,
+    current_user: UserIdentity = Depends(require_roles("admin", "operator")),
+    callsign: str = Form(""),
+    ssid: str = Form(""),
+    beacon_interface_id: str = Form(""),
+    beacon_comment: str = Form(""),
+    beacon_interval_minutes: str = Form("30"),
+    beacon_interval_mode: str = Form(BEACON_INTERVAL_MODE_FIXED),
+    beacon_interval_minutes_fixed: str = Form("30"),
+    beacon_path: str = Form(""),
+    status_enabled: str | None = Form(None),
+    status_text: str = Form(""),
+    status_interval_minutes: str = Form("30"),
+    latitude: str = Form(""),
+    longitude: str = Form(""),
+    symbol_table: str = Form("/"),
+    symbol_code: str = Form(">"),
+    symbol_overlay: str = Form(""),
+    tx_enabled: str | None = Form(None),
+) -> object:
+    wants_json = request.headers.get("x-requested-with", "").lower() == "xmlhttprequest"
+    payload = _station_form_to_station_payload(
+        callsign=callsign, ssid=ssid, beacon_interface_id=beacon_interface_id,
+        beacon_comment=beacon_comment, beacon_interval_minutes=beacon_interval_minutes,
+        beacon_interval_mode=beacon_interval_mode,
+        beacon_interval_minutes_fixed=beacon_interval_minutes_fixed,
+        beacon_path=beacon_path, status_enabled=status_enabled, status_text=status_text,
+        status_interval_minutes=status_interval_minutes, latitude=latitude, longitude=longitude,
+        symbol_table=symbol_table, symbol_code=symbol_code, symbol_overlay=symbol_overlay,
+        tx_enabled=tx_enabled,
+    )
+    ok, message = update_station(station_id, payload)
+    if ok:
+        station_row = get_station(station_id)
+        if station_row is not None:
+            adapted = station_settings_from_station(station_row)
+            ok, message = enqueue_status_job(adapted)
+    return _station_scoped_response(
+        request, current_user, station_id,
+        ok=ok, message=message, wants_json=wants_json, fallback_payload=payload,
+    )
+
+
+@router.post("/station/{station_id}/send-beacon-now")
+def station_detail_send_beacon_now(
+    station_id: int,
+    current_user: UserIdentity = Depends(require_roles("admin", "operator")),
+) -> JSONResponse:
+    station_row = get_station(station_id)
+    if station_row is None:
+        return JSONResponse({"ok": False, "error": "Station not found."}, status_code=status.HTTP_404_NOT_FOUND)
+    adapted = station_settings_from_station(station_row)
+    success, message = enqueue_beacon_job(adapted)
+    return JSONResponse(
+        {"ok": success, "message": message},
+        status_code=status.HTTP_200_OK if success else status.HTTP_400_BAD_REQUEST,
+    )
 
 
 @router.get("/logs")

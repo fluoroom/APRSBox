@@ -8,6 +8,7 @@ from app.db import connection_scope, execute, fetch_all, log_event, set_app_sett
 from app.services.activation_schedule import compute_activation_state
 from app.services.content import get_station_settings, station_has_tx_target
 from app.services.outbound import enqueue_message_job, latest_message_dispatch_at
+from app.services.stations import get_primary_station, get_station, has_stations, station_settings_from_station
 
 
 BULLETIN_LAST_ENQUEUED_KEY_PREFIX = "scheduler.message.last_enqueued_at."
@@ -47,10 +48,6 @@ class BulletinSchedulerService:
             self._tick_scoped()
 
     def _tick_scoped(self) -> None:
-        station_settings = get_station_settings()
-        if not station_settings or not station_settings.get("callsign") or not station_has_tx_target(station_settings):
-            return
-
         now = datetime.now(timezone.utc)
         due_rows = []
         for row in fetch_all(
@@ -59,7 +56,8 @@ class BulletinSchedulerService:
                    bulletins.is_enabled, bulletins.interval_minutes, bulletins.valid_until_utc,
                    activation_mode, active_from_utc, active_until_utc, first_activation_utc,
                    recurrence_duration_minutes, recurrence_interval_value, recurrence_interval_unit, recurrence_until_utc,
-                   path, message_text, bulletins.updated_at, scheduler_setting.value AS last_enqueued_at
+                   path, message_text, bulletins.station_id, bulletins.updated_at,
+                   scheduler_setting.value AS last_enqueued_at
             FROM bulletins
             LEFT JOIN app_settings AS scheduler_setting
               ON scheduler_setting.key = ? || bulletins.id
@@ -86,6 +84,9 @@ class BulletinSchedulerService:
 
         cursor = latest_message_dispatch_at()
         for bulletin in due_rows:
+            station_settings = _resolve_station_settings_for_entity(bulletin)
+            if not station_settings or not station_settings.get("callsign") or not station_has_tx_target(station_settings):
+                continue
             scheduled_for = now
             if cursor is not None:
                 scheduled_for = max(now, cursor + timedelta(seconds=random.randint(*self._jitter_seconds)))
@@ -112,6 +113,25 @@ def _parse_timestamp(value: str | None) -> datetime | None:
     if parsed.tzinfo is None:
         return parsed.replace(tzinfo=timezone.utc)
     return parsed.astimezone(timezone.utc)
+
+
+def _resolve_station_settings_for_entity(entity: dict) -> dict | None:
+    station_id = entity.get("station_id")
+    if station_id is not None:
+        try:
+            sid = int(station_id)
+        except (TypeError, ValueError):
+            sid = None
+        if sid is not None:
+            station = get_station(sid)
+            if station:
+                return station_settings_from_station(station)
+    if has_stations():
+        primary = get_primary_station()
+        if primary:
+            return station_settings_from_station(primary)
+        return None
+    return get_station_settings()
 
 
 def _disable_expired_bulletin(bulletin_id: int, valid_until_utc: str) -> None:

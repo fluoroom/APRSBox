@@ -176,6 +176,33 @@ CREATE TABLE IF NOT EXISTS system_jobs (
     updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS stations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    callsign TEXT,
+    ssid TEXT NOT NULL DEFAULT '',
+    beacon_comment TEXT,
+    beacon_interval_mode TEXT NOT NULL DEFAULT 'fixed' CHECK (beacon_interval_mode IN ('fixed', 'proportional')),
+    beacon_interval_minutes INTEGER NOT NULL DEFAULT 30 CHECK (beacon_interval_minutes IN (15, 30, 45, 60)),
+    beacon_path TEXT,
+    beacon_tx_scope TEXT NOT NULL DEFAULT 'all_active_for_station' CHECK (beacon_tx_scope IN ('single', 'all_active_for_station')),
+    beacon_interface_id INTEGER,
+    status_enabled INTEGER NOT NULL DEFAULT 0 CHECK (status_enabled IN (0, 1)),
+    status_text TEXT,
+    status_interval_minutes INTEGER NOT NULL DEFAULT 30 CHECK (status_interval_minutes IN (15, 30, 45, 60)),
+    latitude TEXT,
+    longitude TEXT,
+    symbol_table TEXT,
+    symbol_code TEXT,
+    symbol_overlay TEXT,
+    tx_enabled INTEGER NOT NULL DEFAULT 0 CHECK (tx_enabled IN (0, 1)),
+    is_primary INTEGER NOT NULL DEFAULT 0 CHECK (is_primary IN (0, 1)),
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    notes TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS modems (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL UNIQUE,
@@ -194,9 +221,11 @@ CREATE TABLE IF NOT EXISTS modems (
     expose_bind_address TEXT NOT NULL DEFAULT '0.0.0.0',
     expose_port INTEGER NOT NULL DEFAULT 8002 CHECK (expose_port BETWEEN 1 AND 65535),
     expose_whitelist TEXT NOT NULL DEFAULT '',
+    station_id INTEGER,
     notes TEXT,
     created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (station_id) REFERENCES stations(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS aprsis_servers (
@@ -364,9 +393,11 @@ CREATE TABLE IF NOT EXISTS aprs_message_conversations (
     remote_ssid TEXT NOT NULL DEFAULT '',
     conversation_kind TEXT NOT NULL DEFAULT 'direct' CHECK (conversation_kind IN ('direct', 'group')),
     path TEXT NOT NULL DEFAULT '',
+    station_id INTEGER,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    UNIQUE (remote_callsign, remote_ssid)
+    UNIQUE (remote_callsign, remote_ssid),
+    FOREIGN KEY (station_id) REFERENCES stations(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS aprs_messages (
@@ -545,7 +576,9 @@ CREATE TABLE IF NOT EXISTS aprs_objects (
     symbol_overlay TEXT,
     path TEXT,
     comment TEXT,
-    updated_at TEXT NOT NULL
+    station_id INTEGER,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (station_id) REFERENCES stations(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS aprs_items (
@@ -570,7 +603,9 @@ CREATE TABLE IF NOT EXISTS aprs_items (
     symbol_overlay TEXT,
     path TEXT,
     comment TEXT,
-    updated_at TEXT NOT NULL
+    station_id INTEGER,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (station_id) REFERENCES stations(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS bulletins (
@@ -592,7 +627,9 @@ CREATE TABLE IF NOT EXISTS bulletins (
     recurrence_until_utc TEXT,
     path TEXT,
     message_text TEXT NOT NULL,
-    updated_at TEXT NOT NULL
+    station_id INTEGER,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (station_id) REFERENCES stations(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS event_logs (
@@ -1105,6 +1142,20 @@ CREATE INDEX IF NOT EXISTS idx_aprsis_igate_station_state_time
     ON aprsis_igate_station_state(last_internet_origin_at DESC);
 CREATE INDEX IF NOT EXISTS idx_aprsis_igate_pending_position_expiry
     ON aprsis_igate_pending_position(expires_at);
+CREATE INDEX IF NOT EXISTS idx_stations_enabled ON stations(enabled, id);
+
+CREATE TABLE IF NOT EXISTS station_aprsis_runtime (
+    station_id INTEGER PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'inactive' CHECK (status IN ('inactive', 'connecting', 'connected', 'error')),
+    status_detail TEXT NOT NULL DEFAULT '',
+    server TEXT,
+    port INTEGER,
+    login TEXT,
+    connected_at TEXT,
+    last_error TEXT,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (station_id) REFERENCES stations(id) ON DELETE CASCADE
+);
 """
 
 
@@ -1127,6 +1178,7 @@ def init_db() -> None:
         station_columns = {row["name"] for row in connection.execute("PRAGMA table_info(station_settings)").fetchall()}
         user_columns = {row["name"] for row in connection.execute("PRAGMA table_info(users)").fetchall()}
         modem_columns = {row["name"] for row in connection.execute("PRAGMA table_info(modems)").fetchall()}
+        stations_columns = {row["name"] for row in connection.execute("PRAGMA table_info(stations)").fetchall()}
         map_columns = {row["name"] for row in connection.execute("PRAGMA table_info(map_sources)").fetchall()}
         wx_columns = {row["name"] for row in connection.execute("PRAGMA table_info(wx_config)").fetchall()}
         object_columns = {row["name"] for row in connection.execute("PRAGMA table_info(aprs_objects)").fetchall()}
@@ -1969,9 +2021,101 @@ CREATE INDEX IF NOT EXISTS idx_aprs_messages_direction_unread_conversation
                 utc_now(),
             ),
         )
+        if "station_id" not in modem_columns:
+            connection.execute(
+                """
+                ALTER TABLE modems
+                ADD COLUMN station_id INTEGER
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_modems_station_id ON modems(station_id)"
+            )
+        if "station_id" not in object_columns:
+            connection.execute(
+                """
+                ALTER TABLE aprs_objects
+                ADD COLUMN station_id INTEGER
+                """
+            )
+        if "station_id" not in item_columns:
+            connection.execute(
+                """
+                ALTER TABLE aprs_items
+                ADD COLUMN station_id INTEGER
+                """
+            )
+        if "station_id" not in bulletin_columns:
+            connection.execute(
+                """
+                ALTER TABLE bulletins
+                ADD COLUMN station_id INTEGER
+                """
+            )
+        if "station_id" not in message_conversation_columns:
+            connection.execute(
+                """
+                ALTER TABLE aprs_message_conversations
+                ADD COLUMN station_id INTEGER
+                """
+            )
+        _migrate_default_station_from_station_settings(connection)
         _normalize_map_sources_table(connection)
         connection.commit()
         _run_database_index_repair_for_update(connection)
+
+
+def _migrate_default_station_from_station_settings(connection: sqlite3.Connection) -> None:
+    """On first run with the stations feature, auto-create a primary station from station_settings."""
+    existing = connection.execute("SELECT COUNT(*) AS total FROM stations").fetchone()
+    if existing and int(existing["total"]) > 0:
+        return
+    row = connection.execute("SELECT * FROM station_settings WHERE id = 1").fetchone()
+    if row is None:
+        return
+    callsign = str(row["callsign"] or "").strip().upper()
+    if not callsign:
+        return
+    now = utc_now()
+    connection.execute(
+        """
+        INSERT INTO stations (
+            name, callsign, ssid,
+            beacon_comment, beacon_interval_mode, beacon_interval_minutes,
+            beacon_path, beacon_tx_scope, beacon_interface_id,
+            status_enabled, status_text, status_interval_minutes,
+            latitude, longitude, symbol_table, symbol_code, symbol_overlay,
+            tx_enabled, is_primary, enabled, notes, created_at, updated_at
+        )
+        VALUES (
+            'Primary', :callsign, :ssid,
+            :beacon_comment, :beacon_interval_mode, :beacon_interval_minutes,
+            :beacon_path, 'all_active_for_station', :beacon_interface_id,
+            :status_enabled, :status_text, :status_interval_minutes,
+            :latitude, :longitude, :symbol_table, :symbol_code, :symbol_overlay,
+            :tx_enabled, 1, 1, '', :now, :now
+        )
+        """,
+        {
+            "callsign": callsign,
+            "ssid": str(row["ssid"] or "").strip(),
+            "beacon_comment": str(row["beacon_comment"] or "").strip(),
+            "beacon_interval_mode": str(row["beacon_interval_mode"] or "fixed").strip(),
+            "beacon_interval_minutes": int(row["beacon_interval_minutes"] or 30),
+            "beacon_path": str(row["beacon_path"] or "").strip(),
+            "beacon_interface_id": row["beacon_interface_id"],
+            "status_enabled": int(row["status_enabled"] or 0),
+            "status_text": str(row["status_text"] or "").strip(),
+            "status_interval_minutes": int(row["status_interval_minutes"] or 30),
+            "latitude": str(row["latitude"] or "").strip(),
+            "longitude": str(row["longitude"] or "").strip(),
+            "symbol_table": str(row["symbol_table"] or "").strip(),
+            "symbol_code": str(row["symbol_code"] or "").strip(),
+            "symbol_overlay": row["symbol_overlay"],
+            "tx_enabled": int(row["tx_enabled"] or 0),
+            "now": now,
+        },
+    )
 
 
 def _migrate_aprs_alert_identity(connection: sqlite3.Connection) -> None:

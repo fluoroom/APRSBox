@@ -385,6 +385,7 @@ def process_normalized_tnc2_rx(
             allow_automatic_responses=collect_statistics or normalized_kind == APRSIS_SOURCE_KIND,
             automatic_response_internal_tx_only=normalized_kind == APRSIS_SOURCE_KIND,
             source_kind=normalized_kind,
+            source_interface_id=source_interface_id,
         )
     with rx_side_effect_stage(stage_collector, "radar"):
         aprs_data = dict(parsed_frame.get("aprs_data") or {})

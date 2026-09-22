@@ -25,3 +25,4 @@ logs/
 config/
 backups/
 /docs
+dev_data/

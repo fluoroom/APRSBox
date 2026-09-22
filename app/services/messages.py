@@ -1141,6 +1141,7 @@ def process_incoming_tnc2_message(
     allow_automatic_responses: bool = True,
     automatic_response_internal_tx_only: bool = False,
     source_kind: str = "rf",
+    source_interface_id: int | None = None,
 ) -> None:
     parsed = _parse_effective_incoming_tnc2_line(line, log_invalid_third_party=True)
     if parsed is None:
@@ -1179,12 +1180,36 @@ def process_incoming_tnc2_message(
     if is_configured_aprs_alarm_group(addressee):
         return
 
-    local_sender = _local_station_identity()
+    # Resolve the station that should respond (based on which modem received this frame)
+    responding_station_settings = _station_settings_for_interface(source_interface_id)
+    local_sender = _identity_from_settings(responding_station_settings)
+    if not local_sender:
+        # Fall back: check if the message matches ANY of our station identities
+        all_identities = _all_local_station_identities()
+        addressee_canonical = _canonical_callsign_identity(addressee)
+        matched_identity = next(
+            (ident for ident in all_identities if _canonical_callsign_identity(ident) == addressee_canonical),
+            None,
+        )
+        if matched_identity:
+            local_sender = matched_identity
+        else:
+            local_sender = _local_station_identity()
+
     recipient_kind = _incoming_message_recipient_kind(
         addressee,
         local_sender,
         source_kind=source_kind,
     )
+    # If the message doesn't match the responding station but matches another station,
+    # check all identities before giving up
+    if recipient_kind is None:
+        for identity in _all_local_station_identities():
+            kind = _incoming_message_recipient_kind(addressee, identity, source_kind=source_kind)
+            if kind == "local":
+                recipient_kind = kind
+                local_sender = identity
+                break
     if recipient_kind is None:
         return
 
@@ -1257,6 +1282,7 @@ def process_incoming_tnc2_message(
                 query_number=query_number,
                 timestamp=received_at,
                 automatic_response_internal_tx_only=automatic_response_internal_tx_only,
+                station_settings=responding_station_settings,
             )
         return
     suffix_match = _MESSAGE_SUFFIX_RE.fullmatch(text_field)
@@ -1276,6 +1302,7 @@ def process_incoming_tnc2_message(
         timestamp=received_at,
         acknowledge=allow_automatic_responses,
         automatic_response_internal_tx_only=automatic_response_internal_tx_only,
+        station_settings=responding_station_settings,
     )
 
 
@@ -1286,9 +1313,10 @@ def _handle_incoming_query(
     query_number: str | None,
     timestamp: str,
     automatic_response_internal_tx_only: bool = False,
+    station_settings: dict[str, Any] | None = None,
 ) -> None:
     query_type = str(query_text or "").strip().upper().split()[0]
-    station_settings = _get_station_settings()
+    station_settings = station_settings if station_settings is not None else _get_station_settings()
     scheduled_for = _query_response_scheduled_for(query_number)
     if query_type in {"?APRS", "?APRS?"}:
         enqueue_automatic_query_text_response(
@@ -1547,10 +1575,11 @@ def store_incoming_message(
     automatic_response_internal_tx_only: bool = False,
     conversation_callsign: str | None = None,
     conversation_kind: str = CONVERSATION_KIND_DIRECT,
+    station_settings: dict[str, Any] | None = None,
 ) -> None:
     if is_configured_aprs_alarm_group(addressee):
         return
-    station_settings = _get_station_settings()
+    station_settings = station_settings if station_settings is not None else _get_station_settings()
     ack_path = _resolve_auto_ack_path(sender=sender, station_settings=station_settings)
     conversation = create_or_update_conversation(
         conversation_callsign or sender,
@@ -2255,8 +2284,60 @@ def _get_station_settings() -> dict[str, Any]:
     return result
 
 
+def _station_settings_for_interface(interface_id: int | None) -> dict[str, Any]:
+    """Return station settings for the modem that received the frame.
+
+    Falls back to the legacy station_settings if no station is assigned to the
+    modem or if no stations exist in the stations table.
+    """
+    if interface_id is None:
+        return _get_station_settings()
+    try:
+        from app.services.stations import get_station_for_modem, has_stations, station_settings_from_station
+        if not has_stations():
+            return _get_station_settings()
+        station = get_station_for_modem(interface_id)
+        if station:
+            return station_settings_from_station(station)
+        # Modem has no station assigned — fall back to primary
+        from app.services.stations import get_primary_station
+        primary = get_primary_station()
+        if primary:
+            return station_settings_from_station(primary)
+    except Exception:
+        pass
+    return _get_station_settings()
+
+
+def _all_local_station_identities() -> set[str]:
+    """Return all callsign-SSID strings that this system considers 'local'."""
+    identities: set[str] = set()
+    try:
+        from app.services.stations import has_stations, list_stations
+        if has_stations():
+            for station in list_stations():
+                callsign = str(station.get("callsign") or "").strip().upper()
+                if not callsign:
+                    continue
+                ssid = str(station.get("ssid") or "").strip()
+                if ssid == "0":
+                    ssid = ""
+                identities.add(f"{callsign}-{ssid}" if ssid else callsign)
+    except Exception:
+        pass
+    # Always include the legacy station_settings identity
+    legacy = _local_station_identity()
+    if legacy:
+        identities.add(legacy)
+    return identities
+
+
 def _local_station_identity() -> str:
     station = _get_station_settings()
+    return _identity_from_settings(station)
+
+
+def _identity_from_settings(station: dict[str, Any]) -> str:
     callsign = str(station.get("callsign") or "").strip().upper()
     if not callsign:
         return ""

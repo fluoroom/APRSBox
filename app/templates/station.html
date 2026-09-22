@@ -441,10 +441,11 @@
                     </label>
                 </div>
             </div>
+            {% set station_base_url = ('/station/' ~ editing_station_id) if editing_station_id is defined and editing_station_id else '/station' %}
             <div class="form-actions">
                 <button type="submit" class="button">{{ t("Save Station Settings") }}</button>
-                <button type="submit" class="button button-secondary" formaction="{{ request.scope.root_path }}/station/send-beacon">{{ t("Send beacon") }}</button>
-                <button type="submit" class="button button-secondary" formaction="{{ request.scope.root_path }}/station/send-status">{{ t("Send status") }}</button>
+                <button type="submit" class="button button-secondary" formaction="{{ request.scope.root_path }}{{ station_base_url }}/send-beacon">{{ t("Send beacon") }}</button>
+                <button type="submit" class="button button-secondary" formaction="{{ request.scope.root_path }}{{ station_base_url }}/send-status">{{ t("Send status") }}</button>
             </div>
         </form>
         <div class="settings-progress-backdrop" id="station-save-progress" hidden>
@@ -891,10 +892,11 @@
                 if (event.defaultPrevented) return;
                 const submitter = event.submitter;
                 const submitterAction = submitter ? (submitter.getAttribute("formaction") || "") : "";
-                const isBeaconAction = submitterAction.endsWith("/station/send-beacon");
-                const isStatusAction = submitterAction.endsWith("/station/send-status");
+                const isBeaconAction = /\/station(?:\/\d+)?\/send-beacon$/.test(submitterAction);
+                const isStatusAction = /\/station(?:\/\d+)?\/send-status$/.test(submitterAction);
                 const isManualAction = isBeaconAction || isStatusAction;
-                if (submitterAction && !isManualAction && !submitterAction.endsWith("/station")) return;
+                const isSaveAction = /\/station(?:\/\d+)?$/.test(submitterAction);
+                if (submitterAction && !isManualAction && !isSaveAction) return;
 
                 if (isManualAction && !bypassManualConfirmation) {
                     event.preventDefault();
@@ -1281,7 +1283,7 @@
                 const submitter = event.submitter instanceof HTMLButtonElement ? event.submitter : null;
                 const submitterAction = submitter ? (submitter.getAttribute("formaction") || "") : "";
                 const action = submitterAction || form.getAttribute("action") || "";
-                const isSaveAction = !action || action.endsWith("/station");
+                const isSaveAction = !action || /\/station(?:\/\d+)?$/.test(action);
                 if (!isSaveAction) {
                     return;
                 }

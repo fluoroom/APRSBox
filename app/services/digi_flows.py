@@ -1529,7 +1529,7 @@ def reload_digi_flow_routing_snapshot() -> DigiFlowRoutingSnapshot:
     global _routing_snapshot, _routing_snapshot_revision
     with _routing_snapshot_reload_lock:
         flows = tuple(_prepare_runtime_flow(flow) for flow in list_enabled_digi_flows())
-        modem_rows = fetch_all("SELECT name, modem_type, enabled, tx_blocked FROM modems")
+        modem_rows = fetch_all("SELECT id, name, modem_type, enabled, tx_blocked, station_id FROM modems")
         modems_by_name = {
             str(row["name"] or "").strip(): dict(row)
             for row in modem_rows
@@ -1546,6 +1546,26 @@ def reload_digi_flow_routing_snapshot() -> DigiFlowRoutingSnapshot:
         local_station_identities: dict[str, str] = {}
         if local_station_identity:
             local_station_identities[local_station_identity] = "my_station"
+        # When multi-station is active, augment identities with all enabled stations
+        from app.services.stations import get_primary_station, has_stations, list_stations as _list_stations
+        if has_stations():
+            for _st in _list_stations():
+                if not bool(_st.get("enabled")):
+                    continue
+                _cs = str(_st.get("callsign") or "").strip().upper()
+                _si = str(_st.get("ssid") or "").strip()
+                if _si == "0":
+                    _si = ""
+                _identity = f"{_cs}-{_si}" if _cs and _si else _cs
+                if _identity:
+                    local_station_identities.setdefault(_identity, "my_station")
+            _primary = get_primary_station()
+            if _primary:
+                _cs = str(_primary.get("callsign") or "").strip().upper()
+                _si = str(_primary.get("ssid") or "").strip()
+                if _si == "0":
+                    _si = ""
+                local_station_identity = f"{_cs}-{_si}" if _cs and _si else _cs
         wx_row = fetch_one("SELECT enabled, callsign, ssid FROM wx_config WHERE id = 1")
         if wx_row is not None:
             wx_callsign = str(wx_row["callsign"] or "").strip().upper() or station_callsign

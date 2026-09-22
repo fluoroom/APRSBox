@@ -2540,7 +2540,7 @@ class DigiFlowRuntimeService:
                 self._finish_aprsis_rf_pending_drop(entry, reason_code=limit_reason, stat_counter="dropped_rate_limit")
                 return
 
-            local_igate = _local_station_identity()
+            local_igate = _station_identity_for_modem(target_name)
             if not local_igate:
                 self._finish_aprsis_rf_pending_drop(entry, reason_code="invalid_aprs", stat_counter="dropped_safety_guard")
                 return
@@ -2815,7 +2815,7 @@ class DigiFlowRuntimeService:
             record_aprsis_tx_result(sent=False, frame_line=str(context.get("current_line") or ""))
             return {"decision": "drop"}
 
-        local_igate = _local_station_identity()
+        local_igate = _station_identity_for_modem(str(context.get("source_ref") or ""))
         if not local_igate:
             message = _t("APRS-IS TX rejected frame because local station identity is not configured.")
             self._log_digi_flow_event(
@@ -3432,6 +3432,39 @@ def _local_station_identity() -> str:
 
 def _local_station_identities() -> dict[str, str]:
     return dict(get_digi_flow_routing_snapshot().local_station_identities)
+
+
+def _station_identity_for_modem(modem_name: str) -> str:
+    """Return the iGate callsign for the station that owns the named modem.
+
+    Falls back to the primary local_station_identity when the modem is
+    unknown or has no station association (preserves single-station behaviour).
+    """
+    if not modem_name:
+        return _local_station_identity()
+    snapshot = get_digi_flow_routing_snapshot()
+    modem = snapshot.modems_by_name.get(modem_name)
+    if modem is None:
+        return _local_station_identity()
+    station_id = modem.get("station_id")
+    if station_id is None:
+        return _local_station_identity()
+    try:
+        from app.services.stations import get_station, has_stations
+        if not has_stations():
+            return _local_station_identity()
+        station = get_station(int(station_id))
+        if station is None:
+            return _local_station_identity()
+        cs = str(station.get("callsign") or "").strip().upper()
+        si = str(station.get("ssid") or "").strip()
+        if si == "0":
+            si = ""
+        if cs:
+            return f"{cs}-{si}" if si else cs
+    except (TypeError, ValueError):
+        pass
+    return _local_station_identity()
 
 
 def _find_consumed_local_identity(path_tokens: list[str], local_identities: dict[str, str]) -> tuple[str, str] | None:

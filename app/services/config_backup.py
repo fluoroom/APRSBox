@@ -15,6 +15,7 @@ _FILENAME_TOKEN_RE = re.compile(r"[^A-Z0-9_-]+")
 
 CONFIG_BACKUP_TABLES: tuple[str, ...] = (
     "map_sources",
+    "stations",
     "modems",
     "aprsis_servers",
     "station_settings",
@@ -31,6 +32,10 @@ CONFIG_BACKUP_TABLES: tuple[str, ...] = (
     "aprs_items",
     "bulletins",
 )
+
+# Tables added after backup format v2 initial release. When absent from a
+# backup file, an empty list is substituted so older v2 backups still import.
+CONFIG_BACKUP_OPTIONAL_TABLES: frozenset[str] = frozenset({"stations"})
 
 CONFIG_BACKUP_APP_SETTING_KEYS: tuple[str, ...] = (
     "app_language",
@@ -168,7 +173,11 @@ def _parse_backup_payload(raw_payload: bytes) -> dict[str, Any]:
     tables_payload = payload.get("tables")
     if not isinstance(tables_payload, dict):
         raise ValueError("Backup payload does not contain configuration tables.")
-    missing_tables = [table for table in CONFIG_BACKUP_TABLES if table not in tables_payload]
+    missing_tables = [
+        table
+        for table in CONFIG_BACKUP_TABLES
+        if table not in tables_payload and table not in CONFIG_BACKUP_OPTIONAL_TABLES
+    ]
     if missing_tables:
         missing = ", ".join(missing_tables)
         raise ValueError(f"Backup payload is missing table data: {missing}.")
@@ -177,8 +186,7 @@ def _parse_backup_payload(raw_payload: bytes) -> dict[str, Any]:
         unexpected = ", ".join(sorted(str(table) for table in unexpected_tables))
         raise ValueError(f"Backup payload contains unsupported table data: {unexpected}.")
 
-    for table in CONFIG_BACKUP_TABLES:
-        rows = tables_payload.get(table)
+    for table, rows in tables_payload.items():
         if not isinstance(rows, list):
             raise ValueError(f"Backup payload contains invalid rows for table '{table}'.")
         for row in rows:
@@ -226,9 +234,10 @@ def _apply_backup_payload(payload: dict[str, Any]) -> None:
         connection.execute("PRAGMA defer_foreign_keys = ON")
 
         _replace_app_settings(connection, app_settings_payload)
-        for table in reversed(CONFIG_BACKUP_TABLES):
+        tables_to_apply = [table for table in CONFIG_BACKUP_TABLES if table in table_payload]
+        for table in reversed(tables_to_apply):
             _delete_missing_table_rows(connection, table, list(table_payload[table]))
-        for table in CONFIG_BACKUP_TABLES:
+        for table in tables_to_apply:
             rows = list(table_payload[table])
             _neutralize_unique_columns(connection, table, rows)
             _sync_table_rows(connection, table, rows)
@@ -339,6 +348,8 @@ def _neutralize_unique_columns(connection: sqlite3.Connection, table_name: str, 
 
 def _validate_table_payload(connection: sqlite3.Connection, table_payload: dict[str, Any]) -> None:
     for table_name in CONFIG_BACKUP_TABLES:
+        if table_name not in table_payload:
+            continue
         expected_columns = set(_backup_table_columns(connection, table_name))
         seen_ids: set[int] = set()
         for row in table_payload[table_name]:
