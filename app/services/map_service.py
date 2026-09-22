@@ -820,6 +820,8 @@ def _build_map_station_marker_rows(snapshots: list[dict[str, Any]]) -> list[dict
             if has_rf_source
             else station.get("interface_id")
         )
+        path_raw = str(station.get("path") or "").strip()
+        path_tokens = [tok.strip() for tok in path_raw.split(",") if tok.strip()]
         stations.append(
             {
                 "callsign": station["callsign"],
@@ -855,6 +857,8 @@ def _build_map_station_marker_rows(snapshots: list[dict[str, Any]]) -> list[dict
                 "entity_class": station["entity_class"],
                 "packet_type": station["frame_type"],
                 "stale": bool((station["last_heard_age_s"] or 0) >= STALE_AFTER_SECONDS),
+                "path": path_raw,
+                "hops": len(path_tokens),
             }
         )
     return stations

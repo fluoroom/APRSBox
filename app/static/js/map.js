@@ -62,6 +62,13 @@
     const toggleMaidenheadGridButton = document.getElementById("map-toggle-maidenhead-grid");
     const toggleMaidenheadGridIcon = document.getElementById("map-toggle-maidenhead-grid-icon");
     const maskOpacitySelect = document.getElementById("map-mask-opacity");
+    const advancedFilterTimeWindow = document.getElementById("map-filter-time-window");
+    const advancedFilterTimeWindowLabel = document.getElementById("map-filter-time-window-label");
+    const advancedFilterCallsign = document.getElementById("map-filter-callsign");
+    const advancedFilterPath = document.getElementById("map-filter-path");
+    const advancedFilterHops = document.getElementById("map-filter-hops");
+    const advancedFilterHopsLabel = document.getElementById("map-filter-hops-label");
+    const advancedFilterReset = document.getElementById("map-filter-reset");
     const coverageFillOpacitySelect = document.getElementById("map-coverage-fill-opacity");
     const coverageOutlineOpacitySelect = document.getElementById("map-coverage-outline-opacity");
     const staticRoot = root.dataset.staticRoot || "/static/";
@@ -177,6 +184,19 @@
     let latestMapAlerts = [];
     let hiddenAlertIds = resolveHiddenAlertIds();
     const interfaceVisibilityByKey = new Map();
+    const ADVANCED_FILTER_STORAGE_KEY = "aprsbox.map.advancedFilters.v1";
+    const TIME_WINDOW_STEPS = [
+        { seconds: 0, label: "All" },
+        { seconds: 86400, label: "24h" },
+        { seconds: 21600, label: "6h" },
+        { seconds: 3600, label: "1h" },
+        { seconds: 1800, label: "30m" },
+        { seconds: 900, label: "15m" },
+        { seconds: 300, label: "5m" },
+        { seconds: 60, label: "1m" },
+    ];
+    const ADVANCED_FILTER_DEFAULTS = { timeWindowIndex: 0, callsign: "", path: "", maxHops: 7 };
+    let advancedFilters = loadAdvancedFilters();
     const markerLayersByKey = new Map();
     const coverageLayersByKey = new Map();
     const trackLayersByKey = new Map();
@@ -1454,6 +1474,127 @@
         return resolvedStations;
     }
 
+    function initAdvancedFilters() {
+        const applyAdvancedFilterChange = () => {
+            persistAdvancedFilters();
+            applyLatestMapData({ forceRender: true });
+        };
+        const syncTimeWindowLabel = () => {
+            const step = TIME_WINDOW_STEPS[advancedFilters.timeWindowIndex] || TIME_WINDOW_STEPS[0];
+            if (advancedFilterTimeWindowLabel) advancedFilterTimeWindowLabel.textContent = step.label;
+        };
+        const syncHopsLabel = () => {
+            if (!advancedFilterHopsLabel) return;
+            advancedFilterHopsLabel.textContent = advancedFilters.maxHops >= 7 ? "any" : String(advancedFilters.maxHops);
+        };
+        // Populate inputs from persisted state
+        if (advancedFilterTimeWindow) {
+            advancedFilterTimeWindow.value = String(advancedFilters.timeWindowIndex);
+            advancedFilterTimeWindow.addEventListener("input", () => {
+                advancedFilters.timeWindowIndex = Number.parseInt(advancedFilterTimeWindow.value, 10) || 0;
+                syncTimeWindowLabel();
+                applyAdvancedFilterChange();
+            });
+        }
+        if (advancedFilterCallsign) {
+            advancedFilterCallsign.value = advancedFilters.callsign;
+            advancedFilterCallsign.addEventListener("input", () => {
+                advancedFilters.callsign = String(advancedFilterCallsign.value || "").trim();
+                applyAdvancedFilterChange();
+            });
+        }
+        if (advancedFilterPath) {
+            advancedFilterPath.value = advancedFilters.path;
+            advancedFilterPath.addEventListener("input", () => {
+                advancedFilters.path = String(advancedFilterPath.value || "").trim();
+                applyAdvancedFilterChange();
+            });
+        }
+        if (advancedFilterHops) {
+            advancedFilterHops.value = String(advancedFilters.maxHops);
+            advancedFilterHops.addEventListener("input", () => {
+                advancedFilters.maxHops = Number.parseInt(advancedFilterHops.value, 10) || 0;
+                syncHopsLabel();
+                applyAdvancedFilterChange();
+            });
+        }
+        if (advancedFilterReset) {
+            advancedFilterReset.addEventListener("click", () => {
+                advancedFilters = { ...ADVANCED_FILTER_DEFAULTS };
+                if (advancedFilterTimeWindow) advancedFilterTimeWindow.value = String(advancedFilters.timeWindowIndex);
+                if (advancedFilterCallsign) advancedFilterCallsign.value = advancedFilters.callsign;
+                if (advancedFilterPath) advancedFilterPath.value = advancedFilters.path;
+                if (advancedFilterHops) advancedFilterHops.value = String(advancedFilters.maxHops);
+                syncTimeWindowLabel();
+                syncHopsLabel();
+                applyAdvancedFilterChange();
+            });
+        }
+        syncTimeWindowLabel();
+        syncHopsLabel();
+    }
+
+    function loadAdvancedFilters() {
+        try {
+            const raw = window.localStorage.getItem(ADVANCED_FILTER_STORAGE_KEY);
+            if (!raw) return { ...ADVANCED_FILTER_DEFAULTS };
+            const parsed = JSON.parse(raw);
+            return {
+                timeWindowIndex: Math.max(0, Math.min(TIME_WINDOW_STEPS.length - 1, Number.parseInt(parsed.timeWindowIndex, 10) || 0)),
+                callsign: String(parsed.callsign || "").trim(),
+                path: String(parsed.path || "").trim(),
+                maxHops: Math.max(0, Math.min(7, Number.parseInt(parsed.maxHops, 10) ?? 7)),
+            };
+        } catch (_error) {
+            return { ...ADVANCED_FILTER_DEFAULTS };
+        }
+    }
+
+    function persistAdvancedFilters() {
+        try {
+            window.localStorage.setItem(ADVANCED_FILTER_STORAGE_KEY, JSON.stringify(advancedFilters));
+        } catch (_error) {
+            /* ignore quota / private mode */
+        }
+    }
+
+    function stationLastHeardAgeSeconds(station) {
+        if (!station) return null;
+        if (Number.isFinite(station.last_heard_age_s)) return Number(station.last_heard_age_s);
+        const ts = station.last_heard_at;
+        if (!ts) return null;
+        const parsed = Date.parse(ts);
+        if (!Number.isFinite(parsed)) return null;
+        return Math.max(0, (Date.now() - parsed) / 1000);
+    }
+
+    function filterStationsByAdvanced(stations) {
+        const step = TIME_WINDOW_STEPS[advancedFilters.timeWindowIndex] || TIME_WINDOW_STEPS[0];
+        const windowSeconds = step.seconds;
+        const callsignNeedle = advancedFilters.callsign.toUpperCase();
+        const pathNeedle = advancedFilters.path.toUpperCase();
+        const maxHops = advancedFilters.maxHops;
+        return (stations || []).filter((station) => {
+            if (windowSeconds > 0) {
+                const age = stationLastHeardAgeSeconds(station);
+                if (age === null || age > windowSeconds) return false;
+            }
+            if (callsignNeedle) {
+                const cs = String(station.display_callsign || "").toUpperCase();
+                if (!cs.includes(callsignNeedle)) return false;
+            }
+            if (pathNeedle) {
+                const path = String(station.path || "").toUpperCase();
+                if (!path.includes(pathNeedle)) return false;
+            }
+            if (maxHops < 7) {
+                const hops = Number.isFinite(station.hops) ? Number(station.hops) : 0;
+                if (hops > maxHops) return false;
+            }
+            return true;
+        });
+    }
+
     function filteredMapData(stations, mobileTracks, interfaces) {
         const { interfacesById, visibleInterfaceIds } = interfaceVisibilityContext(interfaces);
         const { filteredTracks, visiblePointsByStationKey } = filteredMobileTrackData(
@@ -1461,13 +1602,14 @@
             interfacesById,
             visibleInterfaceIds
         );
+        const stationsAfterInterface = stationsAtLatestVisibleTrackPoints(
+            stations,
+            visiblePointsByStationKey,
+            interfacesById,
+            visibleInterfaceIds
+        );
         return {
-            stations: stationsAtLatestVisibleTrackPoints(
-                stations,
-                visiblePointsByStationKey,
-                interfacesById,
-                visibleInterfaceIds
-            ),
+            stations: filterStationsByAdvanced(stationsAfterInterface),
             mobileTracks: filteredTracks,
         };
     }
@@ -1905,6 +2047,7 @@
             applyLatestMapData({ forceRender: true });
         });
     }
+    initAdvancedFilters();
     applyTracksToggleState(resolveTracksVisible());
     if (toggleTracksButton) {
         toggleTracksButton.addEventListener("click", function () {

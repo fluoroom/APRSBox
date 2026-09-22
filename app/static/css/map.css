@@ -133,6 +133,78 @@
     flex-wrap: wrap;
 }
 
+.map-advanced-filters {
+    position: relative;
+    display: inline-block;
+}
+
+.map-advanced-filters-summary {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.28rem;
+    padding: 0.16rem 0.5rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background: var(--panel-alt);
+    color: var(--text);
+    cursor: pointer;
+    font-size: 0.85rem;
+    user-select: none;
+}
+
+.map-advanced-filters[open] .map-advanced-filters-summary {
+    background: var(--accent);
+    color: var(--accent-fg, var(--text));
+}
+
+.map-advanced-filters-body {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    z-index: 500;
+    margin-top: 0.3rem;
+    padding: 0.55rem 0.75rem;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.25);
+    display: flex;
+    flex-direction: row;
+    align-items: flex-end;
+    gap: 0.75rem;
+    white-space: nowrap;
+}
+
+.map-filter-row {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    font-size: 0.78rem;
+    color: var(--text);
+}
+
+.map-filter-row > span {
+    display: block;
+    color: var(--muted, var(--text));
+    font-weight: 500;
+    line-height: 1.1;
+}
+
+.map-filter-row input[type="text"] {
+    width: 9rem;
+    padding: 0.18rem 0.4rem;
+}
+
+.map-filter-row input[type="range"] {
+    width: 8rem;
+}
+
+.map-filter-reset {
+    padding: 0.28rem 0.6rem;
+    font-size: 0.78rem;
+    align-self: flex-end;
+}
+
 .map-interface-filter-chip {
     display: inline-flex;
     align-items: center;

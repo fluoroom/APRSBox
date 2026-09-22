@@ -168,6 +168,33 @@
                         </select>
                     </label>
                     <div id="map-interface-filters" class="map-interface-filters" aria-live="polite"></div>
+                    <details id="map-advanced-filters" class="map-advanced-filters">
+                        <summary class="map-advanced-filters-summary">{{ t("Filters") }}</summary>
+                        <div class="map-advanced-filters-body">
+                            <label class="map-filter-row">
+                                <span>{{ t("Time window") }}: <output id="map-filter-time-window-label">{{ t("All") }}</output></span>
+                                <input type="range" id="map-filter-time-window" min="0" max="7" step="1" value="0" list="map-filter-time-window-ticks">
+                                <datalist id="map-filter-time-window-ticks">
+                                    <option value="0"></option><option value="1"></option><option value="2"></option>
+                                    <option value="3"></option><option value="4"></option><option value="5"></option>
+                                    <option value="6"></option><option value="7"></option>
+                                </datalist>
+                            </label>
+                            <label class="map-filter-row">
+                                <span>{{ t("Callsign") }}</span>
+                                <input type="text" id="map-filter-callsign" placeholder="LU1..." spellcheck="false" autocapitalize="characters">
+                            </label>
+                            <label class="map-filter-row">
+                                <span>{{ t("Path") }}</span>
+                                <input type="text" id="map-filter-path" placeholder="WIDE2" spellcheck="false" autocapitalize="characters">
+                            </label>
+                            <label class="map-filter-row">
+                                <span>{{ t("Max hops") }}: <output id="map-filter-hops-label">7</output></span>
+                                <input type="range" id="map-filter-hops" min="0" max="7" step="1" value="7">
+                            </label>
+                            <button type="button" id="map-filter-reset" class="button button-secondary map-filter-reset">{{ t("Reset filters") }}</button>
+                        </div>
+                    </details>
                 </div>
                 <div class="map-info-strip" aria-live="polite">
                     <span>
