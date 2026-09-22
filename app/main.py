@@ -14,6 +14,7 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from app import __version__, get_version
 from app.config import settings
+from app.auth import ensure_admin_user, user_count
 from app.db import init_db, log_event
 from app.routers import admin, auth, pages
 from app.services.content import (
@@ -70,6 +71,9 @@ def get_client_ip(request: Request) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    if user_count() == 0:
+        ensure_admin_user("admin", "aprs")
+        log_event("WARNING", "auth", "Seeded default admin user (admin/aprs). Change the password.")
     expire_aprs_alerts()
     app.state.traffic_stream_broadcaster = TrafficSnapshotBroadcaster(
         snapshot_provider=get_traffic_snapshot,

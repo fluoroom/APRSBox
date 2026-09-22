@@ -156,3 +156,8 @@ def ensure_admin_user(username: str, password: str) -> bool:
         return False
     create_user(username=username, password=password, role="admin", is_active=True)
     return True
+
+
+def user_count() -> int:
+    row = fetch_one("SELECT COUNT(*) AS n FROM users")
+    return int(row["n"]) if row else 0

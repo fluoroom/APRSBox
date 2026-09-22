@@ -11,6 +11,7 @@ from app.db import connect, log_event, utc_now
 
 CONFIG_BACKUP_FORMAT = "aprsbox-config-backup"
 CONFIG_BACKUP_VERSION = 2
+CONFIG_BACKUP_SUPPORTED_IMPORT_VERSIONS: frozenset[int] = frozenset({1, 2})
 _FILENAME_TOKEN_RE = re.compile(r"[^A-Z0-9_-]+")
 
 CONFIG_BACKUP_TABLES: tuple[str, ...] = (
@@ -33,9 +34,14 @@ CONFIG_BACKUP_TABLES: tuple[str, ...] = (
     "bulletins",
 )
 
-# Tables added after backup format v2 initial release. When absent from a
-# backup file, an empty list is substituted so older v2 backups still import.
-CONFIG_BACKUP_OPTIONAL_TABLES: frozenset[str] = frozenset({"stations"})
+# Tables that may be absent from a backup file. Missing means "leave the
+# current DB rows untouched" — protects legacy backups (v1, or older v2 files
+# from before a table was added) from wiping newer data on import.
+CONFIG_BACKUP_OPTIONAL_TABLES: frozenset[str] = frozenset({
+    "stations",
+    "notification_transports",
+    "notification_radar_rules",
+})
 
 CONFIG_BACKUP_APP_SETTING_KEYS: tuple[str, ...] = (
     "app_language",
@@ -139,6 +145,7 @@ def export_configuration_backup_bytes() -> bytes:
 def import_configuration_backup(raw_payload: bytes) -> None:
     payload = _parse_backup_payload(raw_payload)
     _apply_backup_payload(payload)
+    _synthesize_station_from_legacy_settings()
     log_event("INFO", "settings", "Imported configuration backup snapshot")
 
 
@@ -167,8 +174,10 @@ def _parse_backup_payload(raw_payload: bytes) -> dict[str, Any]:
     if str(payload.get("format") or "") != CONFIG_BACKUP_FORMAT:
         raise ValueError("Unsupported backup format.")
     backup_version = payload.get("backup_version")
-    if isinstance(backup_version, bool) or not isinstance(backup_version, int) or backup_version != CONFIG_BACKUP_VERSION:
+    if isinstance(backup_version, bool) or not isinstance(backup_version, int) or backup_version not in CONFIG_BACKUP_SUPPORTED_IMPORT_VERSIONS:
         raise ValueError("Unsupported backup version.")
+    if backup_version == 1:
+        payload = _convert_v1_payload_to_v2(payload)
 
     tables_payload = payload.get("tables")
     if not isinstance(tables_payload, dict):
@@ -424,3 +433,145 @@ def _station_identity_slug() -> str:
 def _normalize_filename_token(value: str, *, fallback: str) -> str:
     normalized = _FILENAME_TOKEN_RE.sub("_", value.strip().upper()).strip("_-")
     return normalized or fallback
+
+
+# ── v1 → v2 backup converter ─────────────────────────────────────────────────
+#
+# v1 predates: the `stations` table, `notification_transports`,
+# `notification_radar_rules`, the `station_id` column on modems, and many
+# app_settings keys (aprs.*, messages.*, radar_*, etc.). v1 also carried
+# `band_condition_reference_stations` which is no longer part of the backup.
+
+_V1_ONLY_TABLES: frozenset[str] = frozenset({"band_condition_reference_stations"})
+
+
+def _convert_v1_payload_to_v2(payload: dict[str, Any]) -> dict[str, Any]:
+    """Reshape a v1 backup into a v2-compatible payload.
+
+    Missing app_settings become None (import leaves the DB default alone),
+    missing tables are added as empty lists, unknown tables are dropped,
+    and each row is aligned to the current live schema for its table.
+    """
+    v1_app_settings = payload.get("app_settings") or {}
+    if not isinstance(v1_app_settings, dict):
+        raise ValueError("v1 backup payload contains invalid app settings.")
+    v1_tables = payload.get("tables") or {}
+    if not isinstance(v1_tables, dict):
+        raise ValueError("v1 backup payload does not contain configuration tables.")
+
+    app_settings: dict[str, str | None] = {key: None for key in CONFIG_BACKUP_APP_SETTING_KEYS}
+    for key, value in v1_app_settings.items():
+        if key in app_settings:
+            app_settings[key] = value if value is None else str(value)
+
+    with connect() as connection:
+        tables: dict[str, list[dict[str, Any]]] = {}
+        for table_name in CONFIG_BACKUP_TABLES:
+            rows = v1_tables.get(table_name)
+            if not isinstance(rows, list):
+                # Table absent from v1 (e.g. stations, notification_transports).
+                # Leave it out entirely so the optional-table path preserves
+                # any existing DB rows instead of wiping them.
+                continue
+            expected_columns = _backup_table_columns(connection, table_name)
+            tables[table_name] = [_align_row_to_schema(row, expected_columns) for row in rows]
+
+    return {
+        "format": CONFIG_BACKUP_FORMAT,
+        "backup_version": CONFIG_BACKUP_VERSION,
+        "created_at": payload.get("created_at") or utc_now(),
+        "app_version": payload.get("app_version") or get_version(),
+        "app_settings": app_settings,
+        "tables": tables,
+    }
+
+
+def _align_row_to_schema(row: Any, expected_columns: list[str]) -> dict[str, Any]:
+    if not isinstance(row, dict):
+        raise ValueError("v1 backup row is not an object.")
+    aligned: dict[str, Any] = {}
+    for column in expected_columns:
+        aligned[column] = row.get(column)
+    return aligned
+
+
+# ── Post-import synthesis: legacy single station → multi-station entry ───────
+#
+# When a v1 backup (or a v2 backup that predates the stations feature) is
+# imported into an install that has no stations yet, promote the single legacy
+# station in station_settings into a fully-fledged row in the stations table so
+# it shows up in the sidebar and can be edited per-station.
+
+def _synthesize_station_from_legacy_settings() -> None:
+    with connect() as connection:
+        existing_stations = connection.execute("SELECT COUNT(*) AS n FROM stations").fetchone()
+        if existing_stations and int(existing_stations["n"]) > 0:
+            return
+        legacy = connection.execute(
+            """
+            SELECT callsign, ssid, beacon_interface_id, beacon_tx_scope, beacon_comment,
+                   beacon_interval_mode, beacon_interval_minutes, beacon_path,
+                   status_enabled, status_text, status_interval_minutes,
+                   latitude, longitude, symbol_table, symbol_code, symbol_overlay,
+                   tx_enabled
+            FROM station_settings WHERE id = 1
+            """
+        ).fetchone()
+        if legacy is None:
+            return
+        callsign = str(legacy["callsign"] or "").strip().upper()
+        if not callsign:
+            return
+        ssid = str(legacy["ssid"] or "").strip()
+        name = f"{callsign}-{ssid}" if ssid and ssid != "0" else callsign
+        # station_settings.beacon_tx_scope uses 'single' | 'all_active';
+        # stations.beacon_tx_scope uses 'single' | 'all_active_for_station'.
+        legacy_scope = str(legacy["beacon_tx_scope"] or "").strip().lower()
+        station_scope = "single" if legacy_scope == "single" else "all_active_for_station"
+        now = utc_now()
+        connection.execute(
+            """
+            INSERT INTO stations (
+                name, callsign, ssid,
+                beacon_comment, beacon_interval_mode, beacon_interval_minutes,
+                beacon_path, beacon_tx_scope, beacon_interface_id,
+                status_enabled, status_text, status_interval_minutes,
+                latitude, longitude, symbol_table, symbol_code, symbol_overlay,
+                tx_enabled, is_primary, enabled, notes, created_at, updated_at
+            ) VALUES (
+                :name, :callsign, :ssid,
+                :beacon_comment, :beacon_interval_mode, :beacon_interval_minutes,
+                :beacon_path, :beacon_tx_scope, :beacon_interface_id,
+                :status_enabled, :status_text, :status_interval_minutes,
+                :latitude, :longitude, :symbol_table, :symbol_code, :symbol_overlay,
+                :tx_enabled, 0, 1, '', :now, :now
+            )
+            """,
+            {
+                "name": name,
+                "callsign": callsign,
+                "ssid": ssid,
+                "beacon_comment": legacy["beacon_comment"],
+                "beacon_interval_mode": legacy["beacon_interval_mode"] or "fixed",
+                "beacon_interval_minutes": int(legacy["beacon_interval_minutes"] or 30),
+                "beacon_path": legacy["beacon_path"],
+                "beacon_tx_scope": station_scope,
+                "beacon_interface_id": legacy["beacon_interface_id"],
+                "status_enabled": int(legacy["status_enabled"] or 0),
+                "status_text": legacy["status_text"],
+                "status_interval_minutes": int(legacy["status_interval_minutes"] or 30),
+                "latitude": legacy["latitude"],
+                "longitude": legacy["longitude"],
+                "symbol_table": legacy["symbol_table"],
+                "symbol_code": legacy["symbol_code"],
+                "symbol_overlay": legacy["symbol_overlay"],
+                "tx_enabled": int(legacy["tx_enabled"] or 0),
+                "now": now,
+            },
+        )
+        connection.commit()
+        log_event(
+            "INFO",
+            "settings",
+            f"Promoted legacy station_settings to stations row '{name}' during import",
+        )

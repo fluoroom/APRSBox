@@ -217,6 +217,29 @@ def update_station(station_id: int, payload: dict[str, Any]) -> tuple[bool, str]
     return True, f"Station '{values['name']}' updated."
 
 
+def duplicate_station(station_id: int) -> tuple[bool, str, int | None]:
+    """Copy a station row, resolving name collisions with '(copy)', '(copy 2)', ..."""
+    source = get_station(station_id)
+    if source is None:
+        return False, "Station not found.", None
+    base_name = str(source.get("name") or "").strip() or "Station"
+    new_name = _resolve_copy_name(base_name)
+    payload = {k: v for k, v in source.items() if k not in {"id", "created_at", "updated_at"}}
+    payload["name"] = new_name
+    # Reset fields that shouldn't be silently reused across stations
+    payload["enabled"] = int(source.get("enabled") or 0)
+    return create_station(payload)
+
+
+def _resolve_copy_name(base_name: str) -> str:
+    for suffix in ("(copy)", *(f"(copy {i})" for i in range(2, 100))):
+        candidate = f"{base_name} {suffix}"
+        row = fetch_one("SELECT 1 FROM stations WHERE name = ?", (candidate,))
+        if row is None:
+            return candidate
+    raise ValueError(f"Cannot find a free copy name for '{base_name}'.")
+
+
 def delete_station(station_id: int) -> tuple[bool, str]:
     existing = get_station(station_id)
     if existing is None:

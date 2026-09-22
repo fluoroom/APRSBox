@@ -242,6 +242,12 @@
                     </button>
                 </div>
                 <div class="form-grid station-settings-subgrid">
+                    {% if editing_station_id is defined and editing_station_id %}
+                    <label>
+                        <span>{{ t("Station Label") }}</span>
+                        <input type="text" name="name" value="{{ station_name|default('') }}" maxlength="64" required placeholder="{{ t('VHF') }}">
+                    </label>
+                    {% endif %}
                     <label>
                         <span>{{ t("Callsign") }}</span>
                         <input type="text" name="callsign" value="{{ station.callsign }}" maxlength="6" autocapitalize="characters" spellcheck="false" data-force-uppercase="true">

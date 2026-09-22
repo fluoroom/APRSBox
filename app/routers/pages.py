@@ -88,6 +88,7 @@ from app.services.mqtt_url import OPENWEBRX_MQTT_MODEM_TYPE, mask_mqtt_url
 from app.services.stations import (
     create_station,
     delete_station,
+    duplicate_station,
     get_station,
     station_settings_from_station,
     update_station,
@@ -1745,6 +1746,24 @@ def stations_config_delete(
     delete_station(record_id)
     return RedirectResponse(
         url=_path(request, "/settings/stations-config"),
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
+@router.post("/settings/stations-config/{record_id}/duplicate")
+def stations_config_duplicate(
+    record_id: int,
+    request: Request,
+    current_user: UserIdentity = Depends(require_roles("admin", "operator")),
+) -> RedirectResponse:
+    ok, message, new_id = duplicate_station(record_id)
+    if ok and new_id is not None:
+        return RedirectResponse(
+            url=_path(request, f"/station/{new_id}"),
+            status_code=status.HTTP_303_SEE_OTHER,
+        )
+    return RedirectResponse(
+        url=_path(request, f"/settings/stations-config?flash={quote(message)}&success=0"),
         status_code=status.HTTP_303_SEE_OTHER,
     )
 
@@ -3475,6 +3494,7 @@ def station_detail_config_page(
     context["active_nav"] = f"station-{station_id}"
     context["page_title"] = str(station_row.get("name") or f"Station {station_id}")
     context["editing_station_id"] = station_id
+    context["station_name"] = str(station_row.get("name") or "")
     return templates.TemplateResponse("station.html", context)
 
 
@@ -4403,6 +4423,7 @@ def station_send_status(
 
 def _station_form_to_station_payload(
     *,
+    name: str = "",
     callsign: str,
     ssid: str,
     beacon_interface_id: str,
@@ -4433,7 +4454,10 @@ def _station_form_to_station_payload(
     else:
         beacon_iface = None
         tx_scope = "all_active_for_station"
-    return {
+    payload: dict[str, Any] = {}
+    if name.strip():
+        payload["name"] = name.strip()
+    payload.update({
         "callsign": callsign.strip(),
         "ssid": ssid.strip(),
         "beacon_comment": beacon_comment.strip(),
@@ -4451,7 +4475,8 @@ def _station_form_to_station_payload(
         "symbol_code": symbol_code.strip(),
         "symbol_overlay": symbol_overlay.strip(),
         "tx_enabled": 1 if tx_enabled else 0,
-    }
+    })
+    return payload
 
 
 def _station_scoped_response(
@@ -4479,6 +4504,10 @@ def _station_scoped_response(
     )
     context["active_nav"] = f"station-{station_id}"
     context["editing_station_id"] = station_id
+    if updated is not None:
+        context["station_name"] = str(updated.get("name") or "")
+    elif fallback_payload is not None:
+        context["station_name"] = str(fallback_payload.get("name") or "")
     return templates.TemplateResponse(
         "station.html",
         context,
@@ -4491,6 +4520,7 @@ def station_detail_update(
     station_id: int,
     request: Request,
     current_user: UserIdentity = Depends(require_roles("admin", "operator")),
+    name: str = Form(""),
     callsign: str = Form(""),
     ssid: str = Form(""),
     beacon_interface_id: str = Form(""),
@@ -4511,7 +4541,7 @@ def station_detail_update(
 ) -> object:
     wants_json = request.headers.get("x-requested-with", "").lower() == "xmlhttprequest"
     payload = _station_form_to_station_payload(
-        callsign=callsign, ssid=ssid, beacon_interface_id=beacon_interface_id,
+        name=name, callsign=callsign, ssid=ssid, beacon_interface_id=beacon_interface_id,
         beacon_comment=beacon_comment, beacon_interval_minutes=beacon_interval_minutes,
         beacon_interval_mode=beacon_interval_mode,
         beacon_interval_minutes_fixed=beacon_interval_minutes_fixed,
@@ -4532,6 +4562,7 @@ def station_detail_send_beacon(
     station_id: int,
     request: Request,
     current_user: UserIdentity = Depends(require_roles("admin", "operator")),
+    name: str = Form(""),
     callsign: str = Form(""),
     ssid: str = Form(""),
     beacon_interface_id: str = Form(""),
@@ -4552,7 +4583,7 @@ def station_detail_send_beacon(
 ) -> object:
     wants_json = request.headers.get("x-requested-with", "").lower() == "xmlhttprequest"
     payload = _station_form_to_station_payload(
-        callsign=callsign, ssid=ssid, beacon_interface_id=beacon_interface_id,
+        name=name, callsign=callsign, ssid=ssid, beacon_interface_id=beacon_interface_id,
         beacon_comment=beacon_comment, beacon_interval_minutes=beacon_interval_minutes,
         beacon_interval_mode=beacon_interval_mode,
         beacon_interval_minutes_fixed=beacon_interval_minutes_fixed,
@@ -4578,6 +4609,7 @@ def station_detail_send_status(
     station_id: int,
     request: Request,
     current_user: UserIdentity = Depends(require_roles("admin", "operator")),
+    name: str = Form(""),
     callsign: str = Form(""),
     ssid: str = Form(""),
     beacon_interface_id: str = Form(""),
@@ -4598,7 +4630,7 @@ def station_detail_send_status(
 ) -> object:
     wants_json = request.headers.get("x-requested-with", "").lower() == "xmlhttprequest"
     payload = _station_form_to_station_payload(
-        callsign=callsign, ssid=ssid, beacon_interface_id=beacon_interface_id,
+        name=name, callsign=callsign, ssid=ssid, beacon_interface_id=beacon_interface_id,
         beacon_comment=beacon_comment, beacon_interval_minutes=beacon_interval_minutes,
         beacon_interval_mode=beacon_interval_mode,
         beacon_interval_minutes_fixed=beacon_interval_minutes_fixed,

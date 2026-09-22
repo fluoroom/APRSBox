@@ -57,11 +57,18 @@
                             <td>{{ t('Yes' if row.enabled else 'No') }}</td>
                             {% if can_edit and section.supports_delete %}
                             <td>
-                                <form method="post" action="{{ request.scope.root_path }}/settings/stations-config/{{ row.id }}/delete" class="table-action-form" onclick="event.stopPropagation();" onsubmit="event.stopPropagation(); return confirm({{ t('Delete this station?')|tojson }});">
-                                    <button type="submit" class="table-icon-button table-icon-button-danger" title="{{ t('Delete station') }}" aria-label="{{ t('Delete station') }} {{ row.name }}">
-                                        <img src="{{ request.scope.root_path }}/static/icons/delete-outline.svg" alt="">
-                                    </button>
-                                </form>
+                                <div class="digi-flows-actions">
+                                    <form method="post" action="{{ request.scope.root_path }}/settings/stations-config/{{ row.id }}/duplicate" class="table-action-form" onclick="event.stopPropagation();" onsubmit="event.stopPropagation();">
+                                        <button type="submit" class="table-icon-button" title="{{ t('Duplicate station') }}" aria-label="{{ t('Duplicate station') }} {{ row.name }}">
+                                            <img src="{{ request.scope.root_path }}/static/icons/content-copy.svg" alt="">
+                                        </button>
+                                    </form>
+                                    <form method="post" action="{{ request.scope.root_path }}/settings/stations-config/{{ row.id }}/delete" class="table-action-form" onclick="event.stopPropagation();" onsubmit="event.stopPropagation(); return confirm({{ t('Delete this station?')|tojson }});">
+                                        <button type="submit" class="table-icon-button table-icon-button-danger" title="{{ t('Delete station') }}" aria-label="{{ t('Delete station') }} {{ row.name }}">
+                                            <img src="{{ request.scope.root_path }}/static/icons/delete-outline.svg" alt="">
+                                        </button>
+                                    </form>
+                                </div>
                             </td>
                             {% endif %}
                         </tr>
