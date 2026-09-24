@@ -1720,10 +1720,7 @@ class DigiFlowRuntimeService:
             )
             return {"decision": "drop"}
 
-        local_identity = next(
-            (identity for identity, owner in local_identities.items() if owner == _LOCAL_IDENTITY_MY),
-            "",
-        )
+        local_identity = _station_identity_for_modem(str(context.get("source_ref") or ""))
         consumed_local = _find_consumed_local_identity(path_tokens, local_identities)
         if consumed_local is not None:
             consumed_identity = consumed_local[0]

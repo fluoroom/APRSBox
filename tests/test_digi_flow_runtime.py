@@ -992,6 +992,85 @@ class DigiFlowRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(any(row["event_type"] == "path_rule" and row["decision"] == "no_trace" and "SP1-1 -> SP1*" in row["message"] for row in no_trace_local_rows))
             self.assertTrue(any(row["event_type"] == "path_rule" and row["decision"] == "rejected" for row in rejected_rows))
 
+    async def test_path_rule_trace_digipeat_uses_station_linked_to_receiving_tnc(self) -> None:
+        with temporary_database():
+            # A default/global identity that must NOT leak into either flow's
+            # TRACE insertion below -- if it does, the per-TNC station link is
+            # being ignored (the bug that made RF-A always digipeat as if it
+            # were the default/primary station, regardless of which TNC/station
+            # actually received the frame).
+            set_local_station_identity(callsign="SQ9MDD", ssid="9")
+            interface_a_id = insert_modem(name="RF-A", device_path="127.0.0.1:9023")
+            interface_b_id = insert_modem(name="RF-B", device_path="127.0.0.1:9024")
+            execute(
+                """
+                INSERT INTO stations (name, callsign, ssid, enabled, is_primary, tx_enabled, created_at, updated_at)
+                VALUES ('Station A', 'SQ9MDD', '4', 1, 0, 1, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'),
+                       ('Station B', 'SQ9MDD', '7', 1, 0, 1, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')
+                """
+            )
+            station_a_row = fetch_one("SELECT id FROM stations WHERE name = 'Station A'")
+            station_b_row = fetch_one("SELECT id FROM stations WHERE name = 'Station B'")
+            assert station_a_row is not None and station_b_row is not None
+            execute("UPDATE modems SET station_id = ? WHERE id = ?", (int(station_a_row["id"]), interface_a_id))
+            execute("UPDATE modems SET station_id = ? WHERE id = ?", (int(station_b_row["id"]), interface_b_id))
+
+            for tnc_name in ("RF-A", "RF-B"):
+                create_flow(
+                    {
+                        "name": f"Path LOG {tnc_name}",
+                        "description": "",
+                        "source_kind": "receiver_rf",
+                        "source_ref": tnc_name,
+                        "target_kind": "action_log",
+                        "target_ref": "log-only",
+                        "enabled": 1,
+                        "steps": [
+                            {"step_type": "receiver_rf", "title": "Receiver RF", "enabled": 1, "config": {"rf_port": tnc_name}},
+                            {
+                                "step_type": "filter_path",
+                                "title": "Path Rule",
+                                "enabled": 1,
+                                "config": {"mode": "allow", "trace_paths": ["WIDE2-2"], "no_trace_paths": []},
+                            },
+                            {"step_type": "action_log", "title": "Log Only", "enabled": 1, "config": {"log_tag": "log-only", "note": ""}},
+                        ],
+                    }
+                )
+
+            runtime = DigiFlowRuntimeService()
+            await runtime.start()
+            try:
+                result_a = runtime.enqueue_tnc2_frame(
+                    source_kind="receiver_rf",
+                    source_ref="RF-A",
+                    raw_payload="SP8ABC-9>APRS,WIDE2-2:>Trace via A",
+                )
+                result_b = runtime.enqueue_tnc2_frame(
+                    source_kind="receiver_rf",
+                    source_ref="RF-B",
+                    raw_payload="SP8ABC-9>APRS,WIDE2-2:>Trace via B",
+                )
+                await runtime.wait_until_idle()
+            finally:
+                await runtime.stop()
+
+            rows_a = event_rows_for_frame(str(result_a["frame_uid"]))
+            rows_b = event_rows_for_frame(str(result_b["frame_uid"]))
+            self.assertTrue(
+                any(
+                    row["event_type"] == "path_rule" and row["decision"] == "trace" and "SQ9MDD-4*" in row["message"]
+                    for row in rows_a
+                )
+            )
+            self.assertTrue(
+                any(
+                    row["event_type"] == "path_rule" and row["decision"] == "trace" and "SQ9MDD-7*" in row["message"]
+                    for row in rows_b
+                )
+            )
+            self.assertFalse(any("SQ9MDD-9*" in row["message"] for row in rows_a + rows_b))
+
     async def test_path_rule_does_not_expand_family_aliases(self) -> None:
         with temporary_database():
             set_local_station_identity()
