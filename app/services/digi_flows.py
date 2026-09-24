@@ -241,7 +241,16 @@ STEP_TYPE_META: dict[str, dict[str, Any]] = {
         "description": "Carries only frames generated locally by APRSBox.",
         "help_page": "application/packet_routing_flow_local_tx",
         "config_fields": (
-            {"name": "local_tx_source", "label": "Local TX Source", "type": "text", "required": True},
+            {
+                "name": "local_tx_source",
+                "label": "Local TX Source",
+                "type": "text",
+                "required": True,
+                "help_text": (
+                    "Use 'local_tx' to match locally generated frames from every TNC, "
+                    "or enter an exact TNC/RF interface name to match only that station's own transmissions."
+                ),
+            },
         ),
     },
     "filter_dupe": {
@@ -1142,7 +1151,10 @@ def _step_summary(step_type: str, config: dict[str, Any]) -> str:
     if step_type == "receiver_aprsis":
         return f"APRS-IS source: {_normalize_text(config.get('aprsis_source')) or '-'}"
     if step_type == LOCAL_TX_SOURCE_KIND:
-        return _t("Locally generated APRSBox TX frames")
+        local_tx_source = _normalize_text(config.get("local_tx_source"))
+        if local_tx_source and local_tx_source != LOCAL_TX_SOURCE_REF:
+            return _tf("Locally generated APRSBox TX frames from {tnc}", {"tnc": local_tx_source})
+        return _t("Locally generated APRSBox TX frames (any TNC)")
     if step_type == RF_GUARD_STEP_TYPE:
         return _t("APRS validation, loop prevention and initial duplicate suppression.")
     if step_type == MESSAGE_DELIVERY_STEP_TYPE:
@@ -1262,7 +1274,7 @@ def get_digi_flow_reference_options() -> dict[str, list[str]]:
     return {
         "receiver_rf": [str(row["name"]) for row in source_rows if row["name"]],
         APRSIS_FLOW_SOURCE_KIND: [str(row["name"]) for row in aprsis_rows if row["name"]],
-        LOCAL_TX_SOURCE_KIND: [LOCAL_TX_SOURCE_REF],
+        LOCAL_TX_SOURCE_KIND: [LOCAL_TX_SOURCE_REF] + [str(row["name"]) for row in target_rows if row["name"]],
         "tx_rf": [str(row["name"]) for row in target_rows if row["name"]],
         "tx_aprsis": [str(row["name"]) for row in aprsis_rows if row["name"]],
         "action_drop": ["drop"],
@@ -1307,10 +1319,20 @@ def get_digi_flow_endpoint_options(
     source_options.append(
         {
             "value": f"{LOCAL_TX_SOURCE_KIND}::{LOCAL_TX_SOURCE_REF}",
-            "label": _t("Local TX"),
+            "label": _t("Local TX (any TNC)"),
             "kind": LOCAL_TX_SOURCE_KIND,
             "ref": LOCAL_TX_SOURCE_REF,
         }
+    )
+    source_options.extend(
+        {
+            "value": f"{LOCAL_TX_SOURCE_KIND}::{row['name']}",
+            "label": _tf("Local TX · {name}", {"name": row["name"]}),
+            "kind": LOCAL_TX_SOURCE_KIND,
+            "ref": str(row["name"]),
+        }
+        for row in target_rows
+        if row["name"]
     )
     source_options.extend(
         {
@@ -1406,7 +1428,9 @@ def _flow_endpoint_display(kind: Any, ref: Any, *, translate: Any = None) -> str
     normalized_ref = _normalize_text(ref)
     translate = translate or _t
     if normalized_kind == LOCAL_TX_SOURCE_KIND and normalized_ref == LOCAL_TX_SOURCE_REF:
-        return translate("Local TX")
+        return translate("Local TX (any TNC)")
+    if normalized_kind == LOCAL_TX_SOURCE_KIND and normalized_ref:
+        return f"{translate('Local TX')} · {normalized_ref}"
     if normalized_kind == "tx_aprsis" and not normalized_ref:
         return translate("APRS-IS uplink")
     if normalized_kind == "action_log" and normalized_ref == "log-only":

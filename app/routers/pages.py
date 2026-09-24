@@ -1643,6 +1643,13 @@ def modems_create(
         new_aprsis_modem_id = record_id
     if success and normalized_aprsis_config is not None and new_aprsis_modem_id is not None:
         save_aprsis_config(new_aprsis_modem_id, normalized_aprsis_config)
+    if success:
+        # Interfaces feed the same DIGI Flow routing snapshot (modems_by_name,
+        # station links) that create/update/delete on digi_flows already
+        # notifies core about -- without this, core keeps resolving RF-port
+        # station identity and Local TX matching from a stale snapshot until
+        # it is restarted.
+        _notify_core_digi_flows_reload()
     if wants_json:
         if not success:
             return JSONResponse(
@@ -1675,6 +1682,7 @@ def modems_delete(
     current_user: UserIdentity = Depends(require_roles("admin", "operator")),
 ) -> RedirectResponse:
     delete_section_row("modems", record_id)
+    _notify_core_digi_flows_reload()
     return RedirectResponse(url=_path(request, "/settings/modems"), status_code=status.HTTP_303_SEE_OTHER)
 
 

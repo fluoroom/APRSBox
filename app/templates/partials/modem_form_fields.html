@@ -1,4 +1,6 @@
 {% set modem_values = modem_form_data or {} %}
+{% set selected_station_id = modem_values.get('station_id') %}
+{% set selected_station_id = selected_station_id|string if selected_station_id is not none else '' %}
 {% set selected_modem_type = (modem_values.get('modem_type') or 'SERIALL')|upper %}
 {% set stored_device_path = modem_values.get('device_path') or '' %}
 {% set tnc_device_path = stored_device_path if selected_modem_type in ['SERIALL', 'TCP'] else '' %}
@@ -32,6 +34,16 @@
 <label class="full checkbox-row">
     <input type="checkbox" name="enabled" value="1" {% if modem_values.get('enabled') %}checked{% endif %}>
     <span id="modems-enabled-label">{{ t("Enable APRS-IS connection" if selected_modem_type == "APRSIS" else "Enabled") }}</span>
+</label>
+
+<label>
+    <span>{{ t("Station") }}</span>
+    <select name="station_id">
+        {% for option in station_select_options %}
+        <option value="{{ option.value }}" {% if selected_station_id == option.value %}selected{% endif %}>{{ option.label }}</option>
+        {% endfor %}
+    </select>
+    <small class="muted">{{ t("Which station owns this TNC. Used for Packet Routing's Local TX matching and to identify this station's callsign on APRS-IS uplinks made via this interface.") }}</small>
 </label>
 
 <div class="full modem-type-slot" aria-live="polite">

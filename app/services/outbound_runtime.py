@@ -512,6 +512,15 @@ class OutboundService:
         if kind in LOCAL_TX_APRSIS_POSITION_KINDS:
             metadata["aprsis_position_max_age_seconds"] = LOCAL_TX_APRSIS_POSITION_MAX_AGE_SECONDS
 
+        # Route by the physical TNC that actually transmits this station's own
+        # traffic (job.interface_name), so Packet Routing flows can be scoped
+        # to a specific TNC instead of catching every station's Local TX.
+        # Jobs with no bound interface (e.g. internal-only TX) fall back to the
+        # generic "local_tx" source, matched by every Local TX (any TNC) flow.
+        interface_name = str(job.get("interface_name") or "").strip()
+        source_ref = interface_name or LOCAL_TX_SOURCE_REF
+        metadata["local_tx_interface_name"] = interface_name
+
         event_id = str(payload.get("local_tx_event_id") or "").strip()
         forward_key = event_id or f"legacy:{kind}:{tnc2_line}"
         if forward_key in self._local_tx_forwarded_event_ids:
@@ -526,7 +535,7 @@ class OutboundService:
         try:
             self._digi_flow_runtime.enqueue_tnc2_frame(
                 source_kind=LOCAL_TX_SOURCE_KIND,
-                source_ref=LOCAL_TX_SOURCE_REF,
+                source_ref=source_ref,
                 raw_payload=tnc2_line,
                 created_at=created_at,
                 metadata=metadata,

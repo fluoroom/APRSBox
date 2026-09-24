@@ -2122,6 +2122,91 @@ class DigiFlowRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(summaries), 1)
             self.assertEqual(summaries[0]["final_result"], "LOGGED")
 
+    async def test_local_tx_flow_scoped_to_one_tnc_ignores_other_stations_local_tx(self) -> None:
+        with temporary_database():
+            interface_a_id = insert_modem(name="RF-A", device_path="127.0.0.1:9019")
+            interface_b_id = insert_modem(name="RF-B", device_path="127.0.0.1:9020")
+            execute("UPDATE modems SET enabled = 0 WHERE id IN (?, ?)", (interface_a_id, interface_b_id))
+
+            flow_a_id = create_flow(
+                {
+                    "name": "Local TX RF-A only",
+                    "description": "",
+                    "source_kind": "receiver_local_tx",
+                    "source_ref": "RF-A",
+                    "target_kind": "action_log",
+                    "target_ref": "log-only",
+                    "enabled": 1,
+                    "steps": [
+                        {"step_type": "receiver_local_tx", "title": "Local TX", "enabled": 1, "config": {"local_tx_source": "RF-A"}},
+                        {"step_type": "action_log", "title": "Log Only", "enabled": 1, "config": {"log_tag": "log-only", "note": ""}},
+                    ],
+                }
+            )
+            flow_b_id = create_flow(
+                {
+                    "name": "Local TX RF-B only",
+                    "description": "",
+                    "source_kind": "receiver_local_tx",
+                    "source_ref": "RF-B",
+                    "target_kind": "action_log",
+                    "target_ref": "log-only",
+                    "enabled": 1,
+                    "steps": [
+                        {"step_type": "receiver_local_tx", "title": "Local TX", "enabled": 1, "config": {"local_tx_source": "RF-B"}},
+                        {"step_type": "action_log", "title": "Log Only", "enabled": 1, "config": {"log_tag": "log-only", "note": ""}},
+                    ],
+                }
+            )
+            payload_json = json.dumps(
+                {
+                    "callsign": "SQ9MDD",
+                    "ssid": "4",
+                    "status_text": "Local TX per-interface routing",
+                    "trigger": "manual",
+                    "local_tx_event_id": "evt-local-status-scoped",
+                    "local_tx_metadata": {
+                        "origin": "local_generated",
+                        "local_generated": True,
+                        "own_station": True,
+                        "frame_purpose": "status",
+                    },
+                },
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
+            execute(
+                """
+                INSERT INTO outbound_jobs(
+                    kind, interface_id, payload_json, status, scheduled_at,
+                    locked_at, started_at, sent_at, attempt_count, last_error, created_at, updated_at
+                )
+                VALUES
+                    ('status', ?, ?, 'queued', '2026-01-01T00:00:00+00:00', NULL, NULL, NULL, 0, NULL, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')
+                """,
+                (interface_a_id, payload_json),
+            )
+
+            runtime = DigiFlowRuntimeService()
+            outbound_service = OutboundService(digi_flow_runtime=runtime)
+            await runtime.start()
+            try:
+                job = claim_next_outbound_job()
+                assert job is not None
+                await outbound_service._process_job(job)
+                await runtime.wait_until_idle()
+            finally:
+                await runtime.stop()
+
+            # A status generated for RF-A's station must only trigger the RF-A-scoped
+            # flow, never the RF-B-scoped flow -- this is the fix for local beacons
+            # from one station bleeding into another station's routing.
+            summaries_a = get_digi_flow_execution_summaries(flow_a_id, execution_limit=10)
+            summaries_b = get_digi_flow_execution_summaries(flow_b_id, execution_limit=10)
+            self.assertEqual(len(summaries_a), 1)
+            self.assertEqual(summaries_a[0]["final_result"], "LOGGED")
+            self.assertEqual(len(summaries_b), 0)
+
     async def test_outbound_service_enforces_min_tx_gap_on_same_interface(self) -> None:
         with temporary_database():
             insert_modem(name="RF-OUT", device_path="127.0.0.1:9014")

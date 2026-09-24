@@ -51,6 +51,7 @@ from app.services.igate_messaging import (
 from app.services.digi_flows import (
     DigiFlowTraceWriter,
     LOCAL_TX_SOURCE_KIND,
+    LOCAL_TX_SOURCE_REF,
     get_digi_flow_routing_snapshot,
     log_digi_flow_event,
     reload_digi_flow_routing_snapshot,
@@ -850,6 +851,14 @@ class DigiFlowRuntimeService:
         normalized_kind = str(source_kind or "").strip()
         normalized_ref = str(source_ref or "").strip()
         snapshot = get_digi_flow_routing_snapshot()
+        if normalized_kind == LOCAL_TX_SOURCE_KIND:
+            normalized_ref_casefold = normalized_ref.casefold()
+            return [
+                flow
+                for flow in snapshot.by_source_kind.get(normalized_kind, ())
+                if (flow_ref := str(flow.get("source_ref") or "").strip().casefold())
+                in {LOCAL_TX_SOURCE_REF.casefold(), normalized_ref_casefold}
+            ]
         if normalized_kind != "receiver_rf":
             return list(snapshot.by_source_endpoint.get((normalized_kind, normalized_ref), ()))
         return [
