@@ -63,3 +63,31 @@ def restart_core_traffic_monitor() -> dict[str, Any]:
     if not bool(parsed.get("ok")):
         return {"ok": False, "error": str(parsed.get("error") or "aprs-core restart failed")}
     return {"ok": True}
+
+
+def notify_core_digi_flows_reload() -> dict[str, Any]:
+    """Tell the running core process to reload its DIGI Flow routing snapshot.
+
+    The web process and the core process each keep their own in-memory copy
+    of enabled DIGI Flows. Saving a flow here only refreshes this process's
+    copy, so the core process must be told explicitly or it keeps acting on
+    stale (e.g. already-disabled) flows until it is restarted.
+    """
+    request = Request(f"{settings.core_base_url}/api/digi-flows/reload", method="POST")
+    try:
+        with urlopen(request, timeout=3) as response:
+            payload = response.read().decode("utf-8")
+    except HTTPError as exc:
+        return {"ok": False, "error": f"aprs-core HTTP error: {exc.code}"}
+    except URLError as exc:
+        return {"ok": False, "error": f"aprs-core unavailable: {exc.reason}"}
+    except OSError as exc:
+        return {"ok": False, "error": f"aprs-core connection failed: {exc}"}
+
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError:
+        return {"ok": False, "error": "aprs-core returned invalid JSON."}
+    if not bool(parsed.get("ok")):
+        return {"ok": False, "error": str(parsed.get("error") or "aprs-core digi-flows reload failed")}
+    return {"ok": True}

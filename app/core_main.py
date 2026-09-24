@@ -12,6 +12,7 @@ from app.services.alerts import expire_aprs_alerts
 from app.services.beacon_scheduler import BeaconSchedulerService
 from app.services.bulletin_scheduler import BulletinSchedulerService
 from app.services.digi_flow_runtime import DigiFlowRuntimeService
+from app.services.digi_flows import reload_digi_flow_routing_snapshot
 from app.services.maintenance_scheduler import MaintenanceSchedulerService
 from app.services.notifications import (
     radar_notification_dispatcher_snapshot,
@@ -126,6 +127,19 @@ def digi_flow_latency_snapshot() -> JSONResponse:
 async def restart_traffic_monitor() -> JSONResponse:
     await app.state.traffic_monitor.restart()
     log_event("INFO", "traffic", "Traffic monitor runtime restarted by request")
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/digi-flows/reload")
+def digi_flows_reload() -> JSONResponse:
+    # The web process (app.main) and this core process are separate
+    # Python processes, each with its own copy of the DIGI Flow routing
+    # snapshot. Editing a flow from the web UI only refreshes the web
+    # process's cache, so it must call this endpoint to make the running
+    # core process pick up the change immediately instead of waiting for
+    # a core restart.
+    reload_digi_flow_routing_snapshot()
+    log_event("INFO", "config", "DIGI Flow routing snapshot reloaded by request")
     return JSONResponse({"ok": True})
 
 
