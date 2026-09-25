@@ -10,7 +10,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from app import get_version
-from app.db import execute, fetch_all, fetch_one, init_db, set_app_setting
+from app.db import execute, fetch_all, fetch_one, get_connection, init_db, set_app_setting
+from app.db import _migrate_aprs_message_conversations_table
 from app.services.alarm_groups import save_aprs_alarm_groups
 from app.services.content import update_station_settings
 from app.services.messages import (
@@ -25,6 +26,7 @@ from app.services.messages import (
     _format_heard_parts,
     _heard_recently_state,
     clear_message_inbox,
+    create_or_update_conversation,
     delete_conversations,
     get_message_settings,
     get_unread_inbox_count,
@@ -76,6 +78,33 @@ def insert_modem(*, name: str = "Test TNC", device_path: str = "127.0.0.1:9201")
         (name, device_path),
     )
     row = fetch_one("SELECT id FROM modems WHERE name = ?", (name,))
+    assert row is not None
+    return int(row["id"])
+
+
+def insert_station(
+    *,
+    name: str,
+    callsign: str,
+    ssid: str = "1",
+    beacon_interface_id: int | None = None,
+    beacon_tx_scope: str = "single",
+    is_primary: bool = False,
+) -> int:
+    execute(
+        """
+        INSERT INTO stations(
+            name, callsign, ssid, beacon_comment, beacon_interval_mode, beacon_interval_minutes,
+            beacon_path, beacon_tx_scope, beacon_interface_id, status_enabled, status_text,
+            status_interval_minutes, latitude, longitude, symbol_table, symbol_code, symbol_overlay,
+            tx_enabled, is_primary, enabled, notes, created_at, updated_at
+        )
+        VALUES (?, ?, ?, '', 'fixed', 30, '', ?, ?, 0, '', 30, '', '', '/', '>', '', 0, ?, 1, '',
+                '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')
+        """,
+        (name, callsign, ssid, beacon_tx_scope, beacon_interface_id, 1 if is_primary else 0),
+    )
+    row = fetch_one("SELECT id FROM stations WHERE name = ?", (name,))
     assert row is not None
     return int(row["id"])
 
@@ -2312,6 +2341,179 @@ class MessagesFlowTests(unittest.IsolatedAsyncioTestCase):
             ]
             self.assertTrue(matching_logs)
             self.assertTrue(any(raw_line in message for message in matching_logs))
+
+
+class PerStationMessagesTests(unittest.IsolatedAsyncioTestCase):
+    def test_same_remote_callsign_gets_independent_conversations_per_station(self) -> None:
+        with temporary_database():
+            modem_a = insert_modem(name="TNC A", device_path="127.0.0.1:9201")
+            modem_b = insert_modem(name="TNC B", device_path="127.0.0.1:9202")
+            station_a = insert_station(name="Station A", callsign="LU1AQY", ssid="1", beacon_interface_id=modem_a)
+            station_b = insert_station(name="Station B", callsign="LU1AQY", ssid="3", beacon_interface_id=modem_b)
+
+            conversation_a = create_or_update_conversation("SP9XYZ-7", station_id=station_a)
+            conversation_b = create_or_update_conversation("SP9XYZ-7", station_id=station_b)
+
+            self.assertNotEqual(conversation_a["id"], conversation_b["id"])
+            total = fetch_one(
+                "SELECT COUNT(*) AS total FROM aprs_message_conversations WHERE remote_callsign = 'SP9XYZ'"
+            )
+            assert total is not None
+            self.assertEqual(int(total["total"]), 2)
+
+            view_a = get_messages_page_data(station_id=station_a)
+            view_b = get_messages_page_data(station_id=station_b)
+            self.assertEqual([c["id"] for c in view_a["conversations"]], [str(conversation_a["id"])])
+            self.assertEqual([c["id"] for c in view_b["conversations"]], [str(conversation_b["id"])])
+
+    def test_queue_outgoing_message_routes_via_the_conversations_own_station_interface(self) -> None:
+        with temporary_database():
+            modem_a = insert_modem(name="TNC A", device_path="127.0.0.1:9201")
+            modem_b = insert_modem(name="TNC B", device_path="127.0.0.1:9202")
+            station_a = insert_station(name="Station A", callsign="LU1AQY", ssid="1", beacon_interface_id=modem_a)
+            station_b = insert_station(name="Station B", callsign="LU1AQY", ssid="3", beacon_interface_id=modem_b)
+
+            queue_outgoing_message(callsign="SP9XYZ-7", message_text="via station B", station_id=station_b)
+
+            job = fetch_one("SELECT interface_id FROM outbound_jobs WHERE kind = 'message' ORDER BY id DESC LIMIT 1")
+            assert job is not None
+            self.assertEqual(int(job["interface_id"]), modem_b)
+            self.assertNotEqual(int(job["interface_id"]), modem_a)
+
+            message = fetch_one("SELECT sender FROM aprs_messages ORDER BY id DESC LIMIT 1")
+            assert message is not None
+            self.assertEqual(str(message["sender"]), "LU1AQY-3")
+
+    def test_get_unread_inbox_count_aggregates_by_default_and_filters_per_station(self) -> None:
+        with temporary_database():
+            modem_a = insert_modem(name="TNC A", device_path="127.0.0.1:9201")
+            modem_b = insert_modem(name="TNC B", device_path="127.0.0.1:9202")
+            station_a = insert_station(name="Station A", callsign="LU1AQY", ssid="1", beacon_interface_id=modem_a)
+            station_b = insert_station(name="Station B", callsign="LU1AQY", ssid="3", beacon_interface_id=modem_b)
+
+            store_incoming_message(
+                sender="SP9XYZ-7",
+                addressee="LU1AQY-1",
+                message_text="Hello A",
+                message_number="01",
+                path="",
+                timestamp="2026-01-01T00:00:00+00:00",
+                acknowledge=False,
+                station_settings={"station_id": station_a, "callsign": "LU1AQY", "ssid": "1"},
+            )
+            store_incoming_message(
+                sender="SP8ABC",
+                addressee="LU1AQY-3",
+                message_text="Hello B",
+                message_number="01",
+                path="",
+                timestamp="2026-01-01T00:00:00+00:00",
+                acknowledge=False,
+                station_settings={"station_id": station_b, "callsign": "LU1AQY", "ssid": "3"},
+            )
+
+            self.assertEqual(get_unread_inbox_count(), 2)
+            self.assertEqual(get_unread_inbox_count(station_id=station_a), 1)
+            self.assertEqual(get_unread_inbox_count(station_id=station_b), 1)
+
+    def test_clear_message_inbox_only_clears_the_target_station(self) -> None:
+        with temporary_database():
+            modem_a = insert_modem(name="TNC A", device_path="127.0.0.1:9201")
+            modem_b = insert_modem(name="TNC B", device_path="127.0.0.1:9202")
+            station_a = insert_station(name="Station A", callsign="LU1AQY", ssid="1", beacon_interface_id=modem_a)
+            station_b = insert_station(name="Station B", callsign="LU1AQY", ssid="3", beacon_interface_id=modem_b)
+
+            queue_outgoing_message(callsign="SP9XYZ-7", message_text="keep me", station_id=station_b)
+            queue_outgoing_message(callsign="DL1XYZ-9", message_text="clear me", station_id=station_a)
+
+            result = clear_message_inbox(station_id=station_a)
+
+            self.assertEqual(result, {"conversation_count": 1, "message_count": 1})
+            remaining = fetch_all("SELECT remote_callsign FROM aprs_message_conversations")
+            self.assertEqual([str(row["remote_callsign"]) for row in remaining], ["SP9XYZ"])
+
+    def test_migration_backfills_legacy_conversations_onto_the_primary_station(self) -> None:
+        with temporary_database():
+            station_id = insert_station(name="Primary", callsign="LU1AQY", ssid="1", is_primary=True)
+            with get_connection() as connection:
+                connection.executescript(
+                    """
+                    DROP TABLE aprs_message_conversations;
+                    CREATE TABLE aprs_message_conversations (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        remote_callsign TEXT NOT NULL,
+                        remote_ssid TEXT NOT NULL DEFAULT '',
+                        conversation_kind TEXT NOT NULL DEFAULT 'direct',
+                        path TEXT NOT NULL DEFAULT '',
+                        station_id INTEGER,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        UNIQUE (remote_callsign, remote_ssid)
+                    );
+                    INSERT INTO aprs_message_conversations(
+                        remote_callsign, remote_ssid, conversation_kind, path, station_id, created_at, updated_at
+                    ) VALUES (
+                        'SP9XYZ', '7', 'direct', '', NULL,
+                        '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'
+                    );
+                    """
+                )
+                _migrate_aprs_message_conversations_table(connection)
+                connection.commit()
+
+            row = fetch_one("SELECT station_id FROM aprs_message_conversations WHERE remote_callsign = 'SP9XYZ'")
+            assert row is not None
+            self.assertEqual(int(row["station_id"]), station_id)
+
+            # Regression guard: aprs_messages.conversation_id is a foreign key INTO
+            # aprs_message_conversations. SQLite auto-rewrites other tables' FK text
+            # whenever the table they reference is renamed, so a naive rename-based
+            # rebuild of aprs_message_conversations silently repoints this FK at a
+            # dropped "_old" table and breaks every subsequent INSERT into
+            # aprs_messages. Assert the FK still resolves to the live table, and
+            # that sending actually still works end-to-end after migration.
+            foreign_keys = fetch_all("PRAGMA foreign_key_list(aprs_messages)")
+            conversation_fk = next(fk for fk in foreign_keys if str(fk["from"]) == "conversation_id")
+            self.assertEqual(str(conversation_fk["table"]), "aprs_message_conversations")
+
+            modem_id = insert_modem()
+            execute("UPDATE stations SET beacon_interface_id = ? WHERE id = ?", (modem_id, station_id))
+            queue_outgoing_message(callsign="SP9XYZ-7", message_text="post-migration send", station_id=station_id)
+            sent_row = fetch_one("SELECT COUNT(*) AS total FROM aprs_messages WHERE message_text = 'post-migration send'")
+            assert sent_row is not None
+            self.assertEqual(int(sent_row["total"]), 1)
+
+    def test_migration_leaves_station_id_null_when_no_stations_are_configured(self) -> None:
+        with temporary_database():
+            with get_connection() as connection:
+                connection.executescript(
+                    """
+                    DROP TABLE aprs_message_conversations;
+                    CREATE TABLE aprs_message_conversations (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        remote_callsign TEXT NOT NULL,
+                        remote_ssid TEXT NOT NULL DEFAULT '',
+                        conversation_kind TEXT NOT NULL DEFAULT 'direct',
+                        path TEXT NOT NULL DEFAULT '',
+                        station_id INTEGER,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL,
+                        UNIQUE (remote_callsign, remote_ssid)
+                    );
+                    INSERT INTO aprs_message_conversations(
+                        remote_callsign, remote_ssid, conversation_kind, path, station_id, created_at, updated_at
+                    ) VALUES (
+                        'SP9XYZ', '7', 'direct', '', NULL,
+                        '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00'
+                    );
+                    """
+                )
+                _migrate_aprs_message_conversations_table(connection)
+                connection.commit()
+
+            row = fetch_one("SELECT station_id FROM aprs_message_conversations WHERE remote_callsign = 'SP9XYZ'")
+            assert row is not None
+            self.assertIsNone(row["station_id"])
 
 
 if __name__ == "__main__":

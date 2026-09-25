@@ -89,7 +89,10 @@ from app.services.stations import (
     create_station,
     delete_station,
     duplicate_station,
+    get_primary_station,
     get_station,
+    has_stations,
+    list_stations,
     station_settings_from_station,
     update_station,
 )
@@ -5198,12 +5201,27 @@ def statistics_page(
     return templates.TemplateResponse("statistics.html", context)
 
 
+def _primary_or_first_station_id() -> int | None:
+    primary = get_primary_station()
+    if primary and primary.get("id") is not None:
+        return int(primary["id"])
+    stations = list_stations()
+    return int(stations[0]["id"]) if stations else None
+
+
 @router.get("/messages")
 @_scoped_read_model
 def messages_page(
     request: Request,
     current_user: UserIdentity = Depends(require_roles("admin", "operator")),
 ) -> object:
+    if has_stations():
+        target_station_id = _primary_or_first_station_id()
+        if target_station_id is not None:
+            return RedirectResponse(
+                url=_path(request, f"/messages/{target_station_id}"),
+                status_code=status.HTTP_303_SEE_OTHER,
+            )
     templates = request.app.state.templates
     context = build_template_context(
         request,
@@ -5215,19 +5233,47 @@ def messages_page(
     return templates.TemplateResponse("messages.html", context)
 
 
+@router.get("/messages/{station_id}")
+@_scoped_read_model
+def messages_station_page(
+    station_id: int,
+    request: Request,
+    current_user: UserIdentity = Depends(require_roles("admin", "operator")),
+) -> object:
+    station_row = get_station(station_id)
+    if station_row is None:
+        return RedirectResponse(url=_path(request, "/messages"), status_code=status.HTTP_303_SEE_OTHER)
+    station_name = str(station_row.get("name") or "")
+    templates = request.app.state.templates
+    context = build_template_context(
+        request,
+        page_title=station_name or f"Station {station_id}",
+        current_user=current_user,
+        active_nav=f"messages-{station_id}",
+        messages_view=get_live_messages_page_data(station_id=station_id),
+        messages_station_id=station_id,
+        messages_station_name=station_name,
+    )
+    return templates.TemplateResponse("messages.html", context)
+
+
 @router.get("/api/messages")
+@router.get("/api/messages/{station_id:int}")
 @_scoped_read_model
 def messages_snapshot(
+    station_id: int | None = None,
     _: UserIdentity = Depends(require_roles("admin", "operator")),
 ) -> JSONResponse:
-    return JSONResponse(get_live_messages_page_data())
+    return JSONResponse(get_live_messages_page_data(station_id=station_id))
 
 
 @router.get("/api/messages/unread-status")
+@router.get("/api/messages/{station_id:int}/unread-status")
 def messages_unread_status(
+    station_id: int | None = None,
     _: UserIdentity = Depends(require_roles("admin", "operator")),
 ) -> JSONResponse:
-    unread_count = get_unread_inbox_count()
+    unread_count = get_unread_inbox_count(station_id=station_id)
     return JSONResponse({"unread_count": unread_count, "has_unread": unread_count > 0})
 
 
@@ -5253,8 +5299,10 @@ def help_markdown_api(
 
 
 @router.post("/api/messages/conversations")
+@router.post("/api/messages/{station_id:int}/conversations")
 async def messages_create_conversation(
     request: Request,
+    station_id: int | None = None,
     _: UserIdentity = Depends(require_roles("admin", "operator")),
 ) -> JSONResponse:
     payload = await request.json()
@@ -5263,16 +5311,19 @@ async def messages_create_conversation(
             create_or_update_conversation,
             str(payload.get("callsign") or ""),
             path="",
+            station_id=station_id,
         )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=status.HTTP_400_BAD_REQUEST)
-    messages_view = await asyncio.to_thread(get_live_messages_page_data)
+    messages_view = await asyncio.to_thread(get_live_messages_page_data, station_id=station_id)
     return JSONResponse({"conversation_id": str(conversation.get("id") or ""), "messages_view": messages_view})
 
 
 @router.put("/api/messages/settings")
+@router.put("/api/messages/{station_id:int}/settings")
 async def messages_save_settings(
     request: Request,
+    station_id: int | None = None,
     _: UserIdentity = Depends(require_roles("admin", "operator")),
 ) -> JSONResponse:
     payload = await request.json()
@@ -5280,13 +5331,15 @@ async def messages_save_settings(
         settings = await asyncio.to_thread(save_message_settings, payload if isinstance(payload, dict) else {})
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=status.HTTP_400_BAD_REQUEST)
-    messages_view = await asyncio.to_thread(get_live_messages_page_data)
+    messages_view = await asyncio.to_thread(get_live_messages_page_data, station_id=station_id)
     return JSONResponse({"ok": True, "settings": settings, "messages_view": messages_view})
 
 
 @router.post("/api/messages/send")
+@router.post("/api/messages/{station_id:int}/send")
 async def messages_send(
     request: Request,
+    station_id: int | None = None,
     _: UserIdentity = Depends(require_roles("admin", "operator")),
 ) -> JSONResponse:
     payload = await request.json()
@@ -5303,16 +5356,19 @@ async def messages_send(
             callsign=str(payload.get("callsign") or ""),
             message_text=str(payload.get("message_text") or ""),
             path=str(payload.get("path") or ""),
+            station_id=station_id,
         )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=status.HTTP_400_BAD_REQUEST)
-    messages_view = await asyncio.to_thread(get_live_messages_page_data)
+    messages_view = await asyncio.to_thread(get_live_messages_page_data, station_id=station_id)
     return JSONResponse({"message_id": str(message["id"]), "messages_view": messages_view})
 
 
 @router.post("/api/messages/conversations/{conversation_id}/read")
+@router.post("/api/messages/{station_id:int}/conversations/{conversation_id}/read")
 def messages_mark_read(
     conversation_id: int,
+    station_id: int | None = None,
     _: UserIdentity = Depends(require_roles("admin", "operator")),
 ) -> JSONResponse:
     mark_conversation_read(conversation_id)
@@ -5320,9 +5376,11 @@ def messages_mark_read(
 
 
 @router.post("/api/messages/conversations/{conversation_id}/path")
+@router.post("/api/messages/{station_id:int}/conversations/{conversation_id}/path")
 async def messages_update_path(
     conversation_id: int,
     request: Request,
+    station_id: int | None = None,
     _: UserIdentity = Depends(require_roles("admin", "operator")),
 ) -> JSONResponse:
     payload = await request.json()
@@ -5330,22 +5388,26 @@ async def messages_update_path(
         await asyncio.to_thread(update_conversation_path, conversation_id, str(payload.get("path") or ""))
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=status.HTTP_400_BAD_REQUEST)
-    messages_view = await asyncio.to_thread(get_live_messages_page_data)
+    messages_view = await asyncio.to_thread(get_live_messages_page_data, station_id=station_id)
     return JSONResponse({"ok": True, "messages_view": messages_view})
 
 
 @router.post("/api/messages/conversations/{conversation_id}/delete")
+@router.post("/api/messages/{station_id:int}/conversations/{conversation_id}/delete")
 def messages_delete(
     conversation_id: int,
+    station_id: int | None = None,
     _: UserIdentity = Depends(require_roles("admin", "operator")),
 ) -> JSONResponse:
     delete_message_conversation(conversation_id)
-    return JSONResponse({"ok": True, "messages_view": get_live_messages_page_data()})
+    return JSONResponse({"ok": True, "messages_view": get_live_messages_page_data(station_id=station_id)})
 
 
 @router.post("/api/messages/selected-conversations/delete")
+@router.post("/api/messages/{station_id:int}/selected-conversations/delete")
 async def messages_delete_selected(
     request: Request,
+    station_id: int | None = None,
     _: UserIdentity = Depends(require_roles("admin", "operator")),
 ) -> JSONResponse:
     payload = await request.json()
@@ -5357,28 +5419,32 @@ async def messages_delete_selected(
     except (TypeError, ValueError):
         return JSONResponse({"error": "conversation_ids must contain integer IDs."}, status_code=status.HTTP_400_BAD_REQUEST)
     deleted = await asyncio.to_thread(delete_message_conversations, conversation_ids)
-    messages_view = await asyncio.to_thread(get_live_messages_page_data)
+    messages_view = await asyncio.to_thread(get_live_messages_page_data, station_id=station_id)
     return JSONResponse({"ok": True, "deleted": deleted, "messages_view": messages_view})
 
 
 @router.post("/api/messages/clear")
+@router.post("/api/messages/{station_id:int}/clear")
 def messages_clear(
+    station_id: int | None = None,
     _: UserIdentity = Depends(require_roles("admin", "operator")),
 ) -> JSONResponse:
-    deleted = clear_message_inbox()
-    return JSONResponse({"ok": True, "deleted": deleted, "messages_view": get_live_messages_page_data()})
+    deleted = clear_message_inbox(station_id=station_id)
+    return JSONResponse({"ok": True, "deleted": deleted, "messages_view": get_live_messages_page_data(station_id=station_id)})
 
 
 @router.post("/api/messages/{message_id}/retry")
+@router.post("/api/messages/{station_id:int}/{message_id}/retry")
 def messages_retry(
     message_id: int,
+    station_id: int | None = None,
     _: UserIdentity = Depends(require_roles("admin", "operator")),
 ) -> JSONResponse:
     try:
         retry_failed_message(message_id)
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=status.HTTP_400_BAD_REQUEST)
-    return JSONResponse({"ok": True, "messages_view": get_live_messages_page_data()})
+    return JSONResponse({"ok": True, "messages_view": get_live_messages_page_data(station_id=station_id)})
 
 
 @router.get("/api/traffic")

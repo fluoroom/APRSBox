@@ -293,21 +293,35 @@ def reconcile_effective_message_group_conversations(
         if alarm_groups is None
         else normalize_aprs_alarm_groups(alarm_groups)
     )
-    _reconcile_message_group_conversations(
-        [
-            group
-            for group in get_effective_message_target_groups(
-                message_target_groups=message_target_groups,
-                aprsis_target_groups=aprsis_target_groups,
-                alarm_groups=list(configured_alarm_groups),
-            )
-            if group not in configured_alarm_groups
-        ]
-    )
+    groups = [
+        group
+        for group in get_effective_message_target_groups(
+            message_target_groups=message_target_groups,
+            aprsis_target_groups=aprsis_target_groups,
+            alarm_groups=list(configured_alarm_groups),
+        )
+        if group not in configured_alarm_groups
+    ]
+    for scope_station_id in _known_station_scopes():
+        _reconcile_message_group_conversations(groups, station_id=scope_station_id)
 
 
-def _reconcile_message_group_conversations(target_groups: list[str]) -> None:
-    """Move previously stored group traffic into its destination-group thread."""
+def _known_station_scopes() -> list[int | None]:
+    """Every local-station scope conversations can belong to: one entry per
+    configured station, or [None] (the legacy scope) when none are configured."""
+    try:
+        from app.services.stations import has_stations, list_stations
+        if has_stations():
+            return [int(station["id"]) for station in list_stations()]
+    except Exception:
+        pass
+    return [None]
+
+
+def _reconcile_message_group_conversations(target_groups: list[str], *, station_id: int | None = None) -> None:
+    """Move previously stored group traffic into its destination-group thread,
+    scoped to a single local station (or the legacy no-station scope) so a
+    group heard on one station's TNC never merges with another station's."""
     groups = list(
         dict.fromkeys(
             str(group or "").strip().upper()
@@ -318,15 +332,19 @@ def _reconcile_message_group_conversations(target_groups: list[str]) -> None:
     if not groups:
         return
     placeholders = ", ".join("?" for _ in groups)
+    station_filter_sql = "c.station_id = ?" if station_id is not None else "c.station_id IS NULL"
+    station_params: tuple[Any, ...] = (station_id,) if station_id is not None else ()
     message_rows_by_group: dict[str, list[dict[str, Any]]] = {}
     for row in fetch_all(
         f"""
-        SELECT id, conversation_id, addressee AS normalized_addressee
-        FROM aprs_messages
-        WHERE direction = ?
-          AND addressee IN ({placeholders})
+        SELECT m.id, m.conversation_id, m.addressee AS normalized_addressee
+        FROM aprs_messages m
+        JOIN aprs_message_conversations c ON c.id = m.conversation_id
+        WHERE m.direction = ?
+          AND m.addressee IN ({placeholders})
+          AND {station_filter_sql}
         """,
-        (MESSAGE_DIRECTION_RX, *groups),
+        (MESSAGE_DIRECTION_RX, *groups, *station_params),
     ):
         message_rows_by_group.setdefault(str(row["normalized_addressee"]), []).append(dict(row))
     existing_groups = {
@@ -334,11 +352,12 @@ def _reconcile_message_group_conversations(target_groups: list[str]) -> None:
         for row in fetch_all(
             f"""
             SELECT remote_callsign
-            FROM aprs_message_conversations
+            FROM aprs_message_conversations c
             WHERE remote_ssid = ''
               AND remote_callsign IN ({placeholders})
+              AND {station_filter_sql}
             """,
-            tuple(groups),
+            (*groups, *station_params),
         )
     }
     for group in groups:
@@ -348,6 +367,7 @@ def _reconcile_message_group_conversations(target_groups: list[str]) -> None:
         group_conversation = create_or_update_conversation(
             group,
             conversation_kind=CONVERSATION_KIND_GROUP,
+            station_id=station_id,
         )
         group_conversation_id = int(group_conversation["id"])
         source_conversation_ids = {
@@ -358,13 +378,14 @@ def _reconcile_message_group_conversations(target_groups: list[str]) -> None:
         if not source_conversation_ids:
             continue
         with get_connection() as connection:
+            source_placeholders = ", ".join("?" for _ in source_conversation_ids)
             connection.execute(
-                """
+                f"""
                 UPDATE aprs_messages
                 SET conversation_id = ?
-                WHERE direction = ? AND addressee = ? AND conversation_id <> ?
+                WHERE direction = ? AND addressee = ? AND conversation_id IN ({source_placeholders})
                 """,
-                (group_conversation_id, MESSAGE_DIRECTION_RX, group, group_conversation_id),
+                (group_conversation_id, MESSAGE_DIRECTION_RX, group, *source_conversation_ids),
             )
             connection.execute(
                 """
@@ -377,7 +398,6 @@ def _reconcile_message_group_conversations(target_groups: list[str]) -> None:
                 """,
                 (group_conversation_id, group_conversation_id),
             )
-            source_placeholders = ", ".join("?" for _ in source_conversation_ids)
             connection.execute(
                 f"""
                 DELETE FROM aprs_message_conversations
@@ -395,6 +415,7 @@ def create_or_update_conversation(
     *,
     path: str | None = None,
     conversation_kind: str | None = None,
+    station_id: int | None = None,
 ) -> dict[str, Any]:
     requested_kind = str(conversation_kind or "").strip().lower()
     if requested_kind and requested_kind not in {CONVERSATION_KIND_DIRECT, CONVERSATION_KIND_GROUP}:
@@ -413,11 +434,11 @@ def create_or_update_conversation(
     with get_connection() as connection:
         row = connection.execute(
             """
-            SELECT id, remote_callsign, remote_ssid, conversation_kind, path, created_at, updated_at
+            SELECT id, remote_callsign, remote_ssid, conversation_kind, path, station_id, created_at, updated_at
             FROM aprs_message_conversations
-            WHERE remote_callsign = ? AND remote_ssid = ?
+            WHERE remote_callsign = ? AND remote_ssid = ? AND station_id IS ?
             """,
-            (remote_callsign, remote_ssid),
+            (remote_callsign, remote_ssid, station_id),
         ).fetchone()
         if row is None:
             normalized_kind = requested_kind or (
@@ -428,11 +449,11 @@ def create_or_update_conversation(
             cursor = connection.execute(
                 """
                 INSERT INTO aprs_message_conversations(
-                    remote_callsign, remote_ssid, conversation_kind, path, created_at, updated_at
+                    remote_callsign, remote_ssid, conversation_kind, path, station_id, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (remote_callsign, remote_ssid, normalized_kind, path or "", timestamp, timestamp),
+                (remote_callsign, remote_ssid, normalized_kind, path or "", station_id, timestamp, timestamp),
             )
             conversation_id = int(cursor.lastrowid)
         else:
@@ -449,7 +470,7 @@ def create_or_update_conversation(
                 )
     conversation = fetch_one(
         """
-        SELECT id, remote_callsign, remote_ssid, conversation_kind, path, created_at, updated_at
+        SELECT id, remote_callsign, remote_ssid, conversation_kind, path, station_id, created_at, updated_at
         FROM aprs_message_conversations
         WHERE id = ?
         """,
@@ -471,7 +492,7 @@ def update_conversation_path(conversation_id: int, path: str) -> None:
         )
 
 
-def _get_conversation(callsign: str) -> dict[str, Any] | None:
+def _get_conversation(callsign: str, *, station_id: int | None = None) -> dict[str, Any] | None:
     normalized_candidate = str(callsign or "").strip().upper()
     if normalized_candidate in set(get_effective_message_target_groups()):
         normalized_groups = normalize_aprs_alarm_groups([normalized_candidate])
@@ -481,12 +502,12 @@ def _get_conversation(callsign: str) -> dict[str, Any] | None:
     remote_callsign, remote_ssid = split_callsign_ssid(normalized_callsign)
     row = fetch_one(
         """
-        SELECT id, remote_callsign, remote_ssid, conversation_kind, path, created_at, updated_at
+        SELECT id, remote_callsign, remote_ssid, conversation_kind, path, station_id, created_at, updated_at
         FROM aprs_message_conversations
-        WHERE remote_callsign = ? AND remote_ssid = ?
+        WHERE remote_callsign = ? AND remote_ssid = ? AND station_id IS ?
         LIMIT 1
         """,
-        (remote_callsign, remote_ssid),
+        (remote_callsign, remote_ssid, station_id),
     )
     return dict(row) if row else None
 
@@ -496,7 +517,7 @@ def _resolve_auto_ack_path(*, sender: str, station_settings: dict[str, Any]) -> 
     # conversation path remains an explicit peer-specific override.
     default_path = str(get_message_settings()["default_path"])
     try:
-        existing_conversation = _get_conversation(sender)
+        existing_conversation = _get_conversation(sender, station_id=station_settings.get("station_id"))
     except ValueError:
         existing_conversation = None
     if existing_conversation is None:
@@ -508,7 +529,9 @@ def _resolve_auto_ack_path(*, sender: str, station_settings: dict[str, Any]) -> 
     return conversation_path or default_path
 
 
-def queue_outgoing_message(*, callsign: str, message_text: str, path: str = "") -> dict[str, Any]:
+def queue_outgoing_message(
+    *, callsign: str, message_text: str, path: str = "", station_id: int | None = None
+) -> dict[str, Any]:
     normalized_candidate = str(callsign or "").strip().upper()
     effective_groups = set(get_effective_message_target_groups())
     if normalized_candidate in effective_groups:
@@ -519,7 +542,8 @@ def queue_outgoing_message(*, callsign: str, message_text: str, path: str = "") 
     normalized_text = normalize_aprs_message_text(message_text)
     normalized_path = normalize_aprs_path(path)
     timestamp = utc_now()
-    local_sender = _local_station_identity()
+    station_settings = _resolve_station_settings_for_station_id(station_id)
+    local_sender = _identity_from_settings(station_settings)
     if not local_sender:
         raise ValueError(_t("Local station callsign is required."))
     duplicate = _find_recent_outgoing_message_duplicate(
@@ -532,7 +556,7 @@ def queue_outgoing_message(*, callsign: str, message_text: str, path: str = "") 
     if duplicate is not None:
         log_event("INFO", "messages", f"Ignored duplicate outbound APRS send burst to {normalized_callsign}")
         return duplicate
-    existing_conversation = _get_conversation(normalized_callsign)
+    existing_conversation = _get_conversation(normalized_callsign, station_id=station_id)
     is_group = (
         normalized_callsign in effective_groups
         or str((existing_conversation or {}).get("conversation_kind") or "") == CONVERSATION_KIND_GROUP
@@ -543,6 +567,7 @@ def queue_outgoing_message(*, callsign: str, message_text: str, path: str = "") 
         normalized_callsign,
         path=normalized_path,
         conversation_kind=CONVERSATION_KIND_GROUP if is_group else CONVERSATION_KIND_DIRECT,
+        station_id=station_id,
     )
     update_conversation_path(int(conversation["id"]), normalized_path)
 
@@ -571,7 +596,6 @@ def queue_outgoing_message(*, callsign: str, message_text: str, path: str = "") 
         )
         message_id = int(cursor.lastrowid)
 
-    station_settings = _get_station_settings()
     outbound_message = {
         "id": message_id,
         "addressee": normalized_callsign,
@@ -614,12 +638,12 @@ def queue_outgoing_message(*, callsign: str, message_text: str, path: str = "") 
     return message
 
 
-def get_messages_page_data() -> dict[str, Any]:
+def get_messages_page_data(station_id: int | None = None) -> dict[str, Any]:
     with connection_scope():
-        return _get_messages_page_data_scoped()
+        return _get_messages_page_data_scoped(station_id=station_id)
 
 
-def _get_messages_page_data_scoped() -> dict[str, Any]:
+def _get_messages_page_data_scoped(station_id: int | None = None) -> dict[str, Any]:
     try:
         expire_direct_message_timeouts()
     except sqlite3.Error as exc:
@@ -639,26 +663,33 @@ def _get_messages_page_data_scoped() -> dict[str, Any]:
     except sqlite3.Error as exc:
         _safe_messages_warning(f"Failed to load heard station snapshot: {exc}")
         heard_by_key = {}
+    station_filter_sql = "c.station_id = ?" if station_id is not None else "c.station_id IS NULL"
+    station_params: tuple[Any, ...] = (station_id,) if station_id is not None else ()
     try:
         conversation_rows = fetch_all(
-            """
+            f"""
             SELECT c.id, c.remote_callsign, c.remote_ssid, c.conversation_kind, c.path, c.created_at, c.updated_at
             FROM aprs_message_conversations c
+            WHERE {station_filter_sql}
             ORDER BY c.updated_at DESC, c.id DESC
-            """
+            """,
+            station_params,
         )
     except sqlite3.Error as exc:
         _safe_messages_warning(f"Failed to load APRS message conversations: {exc}")
         conversation_rows = []
     try:
         all_message_rows = fetch_all(
-            """
-            SELECT id, conversation_id, direction, sender, addressee, message_text, path,
-                   message_number, status, tx_attempt_count, is_unread, created_at,
-                   updated_at, sent_at, acked_at, last_attempt_at, failed_at, failure_reason
-            FROM aprs_messages
-            ORDER BY conversation_id ASC, created_at ASC, id ASC
-            """
+            f"""
+            SELECT m.id, m.conversation_id, m.direction, m.sender, m.addressee, m.message_text, m.path,
+                   m.message_number, m.status, m.tx_attempt_count, m.is_unread, m.created_at,
+                   m.updated_at, m.sent_at, m.acked_at, m.last_attempt_at, m.failed_at, m.failure_reason
+            FROM aprs_messages m
+            JOIN aprs_message_conversations c ON c.id = m.conversation_id
+            WHERE {station_filter_sql}
+            ORDER BY m.conversation_id ASC, m.created_at ASC, m.id ASC
+            """,
+            station_params,
         )
     except sqlite3.Error as exc:
         _safe_messages_warning(f"Failed to load APRS messages: {exc}")
@@ -668,7 +699,7 @@ def _get_messages_page_data_scoped() -> dict[str, Any]:
         messages_by_conversation.setdefault(int(item["conversation_id"]), []).append(dict(item))
     conversations: list[dict[str, Any]] = []
     active_conversation_id: str | None = None
-    local_sender = _local_station_identity()
+    local_sender = _identity_from_settings(_resolve_station_settings_for_station_id(station_id))
     alarm_groups = set(configured_alarm_groups)
     for row in conversation_rows:
         display_callsign = format_display_callsign(str(row["remote_callsign"]), str(row["remote_ssid"]))
@@ -736,28 +767,41 @@ def _get_messages_page_data_scoped() -> dict[str, Any]:
     }
 
 
-def get_unread_inbox_count() -> int:
+def get_unread_inbox_count(station_id: int | None = None) -> int:
+    """Count unread inbound messages.
+
+    NOTE the None-semantics here are the OPPOSITE of get_messages_page_data's:
+    station_id=None means "aggregate across every station" (used for the
+    top-level nav badge), while a concrete id filters to that station only
+    (used for a per-station nav badge). This is intentional, not a bug.
+    """
+    query = """
+        SELECT c.remote_callsign, c.remote_ssid, m.addressee,
+               COUNT(m.id) AS unread_count
+        FROM aprs_message_conversations c
+        JOIN aprs_messages m ON m.conversation_id = c.id
+        WHERE m.direction = ? AND m.is_unread = 1
+    """
+    params: list[Any] = [MESSAGE_DIRECTION_RX]
+    if station_id is not None:
+        query += " AND c.station_id = ?"
+        params.append(station_id)
+    query += " GROUP BY c.id, c.remote_callsign, c.remote_ssid, m.addressee"
     try:
-        rows = fetch_all(
-            """
-            SELECT c.remote_callsign, c.remote_ssid, m.addressee,
-                   COUNT(m.id) AS unread_count
-            FROM aprs_message_conversations c
-            JOIN aprs_messages m ON m.conversation_id = c.id
-            WHERE m.direction = ? AND m.is_unread = 1
-            GROUP BY c.id, c.remote_callsign, c.remote_ssid, m.addressee
-            """,
-            (MESSAGE_DIRECTION_RX,),
-        )
+        rows = fetch_all(query, tuple(params))
     except sqlite3.Error as exc:
         _safe_messages_warning(f"Failed to load unread inbox count: {exc}")
         return 0
-    local_sender = _local_station_identity()
+    local_identities = (
+        {_identity_from_settings(_resolve_station_settings_for_station_id(station_id))}
+        if station_id is not None
+        else _all_local_station_identities()
+    )
     alarm_groups = set(get_aprs_alarm_groups())
     unread_total = 0
     for row in rows:
         display_callsign = format_display_callsign(str(row["remote_callsign"]), str(row["remote_ssid"]))
-        if local_sender and _callsign_identity_matches(display_callsign, local_sender):
+        if any(identity and _callsign_identity_matches(display_callsign, identity) for identity in local_identities):
             continue
         if display_callsign.strip().upper() in alarm_groups:
             continue
@@ -815,14 +859,35 @@ def delete_conversations(conversation_ids: list[int]) -> dict[str, int]:
     }
 
 
-def clear_message_inbox() -> dict[str, int]:
-    message_ids = [int(row["id"]) for row in fetch_all("SELECT id FROM aprs_messages ORDER BY id ASC")]
-    conversation_row = fetch_one("SELECT COUNT(*) AS total FROM aprs_message_conversations")
+def clear_message_inbox(station_id: int | None = None) -> dict[str, int]:
+    station_filter_sql = "c.station_id = ?" if station_id is not None else "c.station_id IS NULL"
+    bare_station_filter_sql = "station_id = ?" if station_id is not None else "station_id IS NULL"
+    station_params: tuple[Any, ...] = (station_id,) if station_id is not None else ()
+    message_ids = [
+        int(row["id"])
+        for row in fetch_all(
+            f"""
+            SELECT m.id
+            FROM aprs_messages m
+            JOIN aprs_message_conversations c ON c.id = m.conversation_id
+            WHERE {station_filter_sql}
+            ORDER BY m.id ASC
+            """,
+            station_params,
+        )
+    ]
+    conversation_row = fetch_one(
+        f"SELECT COUNT(*) AS total FROM aprs_message_conversations WHERE {bare_station_filter_sql}",
+        station_params,
+    )
     conversation_count = int(conversation_row["total"] or 0) if conversation_row is not None else 0
     for message_id in message_ids:
         cancel_pending_message_jobs(message_id)
     with get_connection() as connection:
-        connection.execute("DELETE FROM aprs_message_conversations")
+        connection.execute(
+            f"DELETE FROM aprs_message_conversations WHERE {bare_station_filter_sql}",
+            station_params,
+        )
     return {
         "conversation_count": conversation_count,
         "message_count": len(message_ids),
@@ -1014,7 +1079,9 @@ def retry_failed_message(message_id: int) -> dict[str, Any]:
     refreshed = get_message(message_id)
     if refreshed is None:
         raise ValueError(_t("Message could not be reloaded."))
-    station_settings = _get_station_settings()
+    station_settings = _resolve_station_settings_for_station_id(
+        _station_id_for_conversation(int(refreshed["conversation_id"]))
+    )
     refreshed_text = str(refreshed.get("message_text") or "").strip()
     if refreshed_text.startswith("?"):
         success, error = enqueue_query_message_job(refreshed, station_settings, trigger="manual-retry")
@@ -1076,7 +1143,9 @@ def schedule_message_retry(message_id: int, delay_seconds: int) -> None:
     )
     if existing is not None:
         return
-    station_settings = _get_station_settings()
+    station_settings = _resolve_station_settings_for_station_id(
+        _station_id_for_conversation(int(message["conversation_id"]))
+    )
     scheduled_for = datetime.now(timezone.utc) + timedelta(seconds=delay_seconds)
     success, error = enqueue_direct_message_job(message, station_settings, trigger="retry", scheduled_for=scheduled_for)
     if not success:
@@ -1164,6 +1233,9 @@ def process_incoming_tnc2_message(
             line=line,
         )
         return
+    # Resolve the station that should respond (based on which modem received this frame)
+    responding_station_settings = _station_settings_for_interface(source_interface_id)
+
     if addressee.upper().startswith("BLN"):
         store_incoming_bulletin(
             sender=sender,
@@ -1171,6 +1243,7 @@ def process_incoming_tnc2_message(
             message_text=text_field,
             path=parsed["path"],
             timestamp=_normalize_timestamp(timestamp),
+            station_id=responding_station_settings.get("station_id"),
         )
         return
 
@@ -1180,8 +1253,6 @@ def process_incoming_tnc2_message(
     if is_configured_aprs_alarm_group(addressee):
         return
 
-    # Resolve the station that should respond (based on which modem received this frame)
-    responding_station_settings = _station_settings_for_interface(source_interface_id)
     local_sender = _identity_from_settings(responding_station_settings)
     if not local_sender:
         # Fall back: check if the message matches ANY of our station identities
@@ -1261,6 +1332,7 @@ def process_incoming_tnc2_message(
             acknowledge=False,
             conversation_callsign=addressee.upper() if recipient_kind == "group" else sender,
             conversation_kind=CONVERSATION_KIND_GROUP if recipient_kind == "group" else CONVERSATION_KIND_DIRECT,
+            station_settings=responding_station_settings,
         )
         return
     if text_field.startswith("?"):
@@ -1274,6 +1346,7 @@ def process_incoming_tnc2_message(
             query_number=query_number,
             path=parsed["path"],
             timestamp=received_at,
+            station_id=responding_station_settings.get("station_id"),
         )
         if is_new_query and allow_automatic_responses:
             _handle_incoming_query(
@@ -1406,6 +1479,7 @@ def enqueue_automatic_query_text_response(
         message_text=response_text,
         path=response_path,
         timestamp=timestamp,
+        station_id=station_settings.get("station_id"),
     )
     success, error = enqueue_query_response_job(
         addressee=sender,
@@ -1440,6 +1514,7 @@ def enqueue_automatic_query_position_response(
         message_text=response_text,
         path=response_path,
         timestamp=timestamp,
+        station_id=station_settings.get("station_id"),
     )
     success, error = enqueue_beacon_job(
         station_settings,
@@ -1472,6 +1547,7 @@ def enqueue_automatic_query_status_response(
         message_text=response_text,
         path=response_path,
         timestamp=timestamp,
+        station_id=station_settings.get("station_id"),
     )
     success, error = enqueue_status_job(
         station_settings,
@@ -1584,6 +1660,7 @@ def store_incoming_message(
     conversation = create_or_update_conversation(
         conversation_callsign or sender,
         conversation_kind=conversation_kind,
+        station_id=station_settings.get("station_id"),
     )
     duplicate_unnumbered = (
         not message_number
@@ -1672,8 +1749,9 @@ def store_incoming_query(
     query_number: str | None,
     path: str,
     timestamp: str,
+    station_id: int | None = None,
 ) -> bool:
-    conversation = create_or_update_conversation(sender, conversation_kind=CONVERSATION_KIND_DIRECT)
+    conversation = create_or_update_conversation(sender, conversation_kind=CONVERSATION_KIND_DIRECT, station_id=station_id)
     existing = None
     if query_number:
         existing = fetch_one(
@@ -1728,8 +1806,9 @@ def store_incoming_bulletin(
     message_text: str,
     path: str,
     timestamp: str,
+    station_id: int | None = None,
 ) -> None:
-    conversation = create_or_update_conversation(sender, conversation_kind=CONVERSATION_KIND_DIRECT)
+    conversation = create_or_update_conversation(sender, conversation_kind=CONVERSATION_KIND_DIRECT, station_id=station_id)
     display_text = _format_bulletin_display_text(addressee, message_text)
     existing = fetch_one(
         """
@@ -1772,11 +1851,13 @@ def store_incoming_bulletin(
     log_event("INFO", "messages", f"Stored inbound APRS bulletin from {sender} to {addressee}")
 
 
-def create_automatic_query_response(*, sender: str, message_text: str, path: str, timestamp: str) -> int:
-    local_sender = _local_station_identity()
+def create_automatic_query_response(
+    *, sender: str, message_text: str, path: str, timestamp: str, station_id: int | None = None
+) -> int:
+    local_sender = _identity_from_settings(_resolve_station_settings_for_station_id(station_id))
     if not local_sender:
         raise ValueError(_t("Local station callsign is required."))
-    conversation = create_or_update_conversation(sender, conversation_kind=CONVERSATION_KIND_DIRECT)
+    conversation = create_or_update_conversation(sender, conversation_kind=CONVERSATION_KIND_DIRECT, station_id=station_id)
     with get_connection() as connection:
         cursor = connection.execute(
             """
@@ -2307,6 +2388,41 @@ def _station_settings_for_interface(interface_id: int | None) -> dict[str, Any]:
     except Exception:
         pass
     return _get_station_settings()
+
+
+def _resolve_station_settings_for_station_id(station_id: int | None) -> dict[str, Any]:
+    """Resolve station settings for a specific local station id, mirroring
+    object_scheduler._resolve_station_settings_for_entity: a concrete
+    station_id resolves that station; otherwise fall back to the primary
+    station when stations exist, or the legacy global station_settings row."""
+    if station_id is not None:
+        try:
+            from app.services.stations import get_station, station_settings_from_station
+            station = get_station(station_id)
+            if station:
+                return station_settings_from_station(station)
+        except Exception:
+            pass
+    try:
+        from app.services.stations import get_primary_station, has_stations, station_settings_from_station
+        if has_stations():
+            primary = get_primary_station()
+            if primary:
+                return station_settings_from_station(primary)
+    except Exception:
+        pass
+    return _get_station_settings()
+
+
+def _station_id_for_conversation(conversation_id: int) -> int | None:
+    row = fetch_one(
+        "SELECT station_id FROM aprs_message_conversations WHERE id = ?",
+        (conversation_id,),
+    )
+    if row is None:
+        return None
+    value = row["station_id"]
+    return int(value) if value is not None else None
 
 
 def _all_local_station_identities() -> set[str]:

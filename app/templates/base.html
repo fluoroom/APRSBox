@@ -136,7 +136,7 @@
             {% else %}
             <a
                 href="{{ request.scope.root_path }}{{ item.href }}"
-                class="nav-link {% if active_nav == item.key %}active{% endif %}{% if (item.key == 'messages' and item.has_unread) or item.has_attention %} nav-link-unread{% endif %}"
+                class="nav-link {% if active_nav == item.key %}active{% endif %}{% if (item.key.startswith('messages') and item.has_unread) or item.has_attention %} nav-link-unread{% endif %}"
                 data-nav-key="{{ item.key }}"
                 aria-label="{{ item.label }}"
                 title="{{ item.label }}"
@@ -252,15 +252,6 @@
                     return;
                 }
             };
-
-            window.addEventListener("aprsbox:messages-unread-state", (event) => {
-                const detail = event.detail || {};
-                applyUnreadState(Boolean(detail.hasUnread), Number(detail.unreadCount || 0));
-            });
-
-            if (document.getElementById("messages-app")) {
-                return;
-            }
 
             refreshTimer = window.setInterval(() => {
                 void refreshUnreadState();

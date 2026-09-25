@@ -400,7 +400,7 @@ CREATE TABLE IF NOT EXISTS aprs_message_conversations (
     station_id INTEGER,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    UNIQUE (remote_callsign, remote_ssid),
+    UNIQUE (station_id, remote_callsign, remote_ssid),
     FOREIGN KEY (station_id) REFERENCES stations(id) ON DELETE SET NULL
 );
 
@@ -2050,6 +2050,7 @@ CREATE INDEX IF NOT EXISTS idx_aprs_messages_direction_unread_conversation
                 """
             )
         _migrate_default_station_from_station_settings(connection)
+        _migrate_aprs_message_conversations_table(connection)
         _migrate_aprsis_multi_connection(connection)
         _normalize_map_sources_table(connection)
         connection.commit()
@@ -2106,6 +2107,62 @@ def _migrate_default_station_from_station_settings(connection: sqlite3.Connectio
             "tx_enabled": int(row["tx_enabled"] or 0),
             "now": now,
         },
+    )
+
+
+def _migrate_aprs_message_conversations_table(connection: sqlite3.Connection) -> None:
+    """Rebuild aprs_message_conversations so a remote peer can have an
+    independent conversation with each local station, and backfill any
+    pre-existing (station-agnostic) conversations onto the primary station."""
+    conversations_sql = _table_sql(connection, "aprs_message_conversations")
+    if not conversations_sql:
+        return
+    if "UNIQUE (station_id, remote_callsign, remote_ssid)" in conversations_sql:
+        return
+    # Matches app.services.stations.get_primary_station(): the first enabled
+    # station by id, not the (unused elsewhere) is_primary flag.
+    backfill_row = connection.execute(
+        "SELECT id FROM stations WHERE enabled = 1 ORDER BY id ASC LIMIT 1"
+    ).fetchone()
+    if backfill_row is None:
+        backfill_row = connection.execute("SELECT id FROM stations ORDER BY id ASC LIMIT 1").fetchone()
+    backfill_station_id = int(backfill_row["id"]) if backfill_row is not None else None
+    backfill_expr = str(backfill_station_id) if backfill_station_id is not None else "NULL"
+    # NOTE: build the replacement under a temporary name and swap it into place
+    # afterwards (create-new, drop-old, rename-into-place) rather than renaming
+    # the live table away first. aprs_messages.conversation_id holds a foreign
+    # key INTO this table; SQLite auto-rewrites other tables' FK text whenever
+    # the table they reference is renamed, so renaming this table away first
+    # would silently repoint that FK at the doomed "_old" table and break every
+    # INSERT into aprs_messages once it's dropped. Renaming a fresh, unreferenced
+    # temp table into the final name triggers no such rewrite.
+    connection.executescript(
+        f"""
+        CREATE TABLE aprs_message_conversations_new (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            remote_callsign TEXT NOT NULL,
+            remote_ssid TEXT NOT NULL DEFAULT '',
+            conversation_kind TEXT NOT NULL DEFAULT 'direct' CHECK (conversation_kind IN ('direct', 'group')),
+            path TEXT NOT NULL DEFAULT '',
+            station_id INTEGER,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE (station_id, remote_callsign, remote_ssid),
+            FOREIGN KEY (station_id) REFERENCES stations(id) ON DELETE SET NULL
+        );
+        INSERT INTO aprs_message_conversations_new(
+            id, remote_callsign, remote_ssid, conversation_kind, path, station_id, created_at, updated_at
+        )
+        SELECT
+            id, remote_callsign, remote_ssid, conversation_kind, path,
+            COALESCE(station_id, {backfill_expr}), created_at, updated_at
+        FROM aprs_message_conversations;
+        DROP TABLE aprs_message_conversations;
+        ALTER TABLE aprs_message_conversations_new RENAME TO aprs_message_conversations;
+        CREATE INDEX IF NOT EXISTS idx_aprs_message_conversations_remote ON aprs_message_conversations(remote_callsign, remote_ssid);
+        CREATE INDEX IF NOT EXISTS idx_aprs_message_conversations_station_updated
+            ON aprs_message_conversations(station_id, updated_at, id);
+        """
     )
 
 

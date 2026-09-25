@@ -19,13 +19,13 @@
 </div>
 <div class="messages-page-layout">
 <section class="panel messages-page-panel">
-    <div class="messages-shell" id="messages-app" data-static-root="{{ request.scope.root_path }}/static/">
+    <div class="messages-shell" id="messages-app" data-static-root="{{ request.scope.root_path }}/static/" data-station-id="{{ messages_station_id or '' }}">
         <aside class="messages-sidebar">
             <div class="messages-sidebar-top">
                 <div class="panel-header">
                     <div class="panel-header-copy">
                         <div class="messages-sidebar-title-row">
-                            <h2>{{ t("Conversations") }}</h2>
+                            <h2>{% if messages_station_name %}{{ messages_station_name }} &middot; {% endif %}{{ t("Conversations") }}</h2>
                             <span
                                 class="messages-inbox-count"
                                 id="messages-inbox-count"
@@ -217,7 +217,9 @@
             .map((value) => normalizeCallsign(value))
             .filter((value) => value.length > 0)
     );
-    const messagesApi = `${window.location.pathname.replace(/\/messages$/, "")}/api/messages`.replace(/\/\//g, "/");
+    const stationId = app.dataset.stationId || "";
+    const rootPath = staticRoot.replace(/\/static\/$/, "");
+    const messagesApi = (stationId ? `${rootPath}/api/messages/${stationId}` : `${rootPath}/api/messages`).replace(/\/\//g, "/");
     const requestedCallsign = new URLSearchParams(window.location.search).get("callsign");
     const i18n = Object.freeze({
         requestFailed: {{ t("Request failed.")|tojson }},
@@ -794,19 +796,6 @@
             : i18n.selectConversationToEnableComposer;
     }
 
-    function syncGlobalUnreadState() {
-        const unreadCount = state.conversations.reduce(
-            (total, conversation) => total + Math.max(Number(conversation.unread_count || 0), 0),
-            0
-        );
-        window.dispatchEvent(new CustomEvent("aprsbox:messages-unread-state", {
-            detail: {
-                hasUnread: unreadCount > 0,
-                unreadCount,
-            },
-        }));
-    }
-
     function render(options = {}) {
         renderConversationList();
         const activeConversation = getActiveConversation();
@@ -819,7 +808,6 @@
             inboxCount.setAttribute("aria-label", `${i18n.messagesAllNew}: ${counts.total} / ${counts.unread}`);
         }
         syncSelectionControls();
-        syncGlobalUnreadState();
     }
 
     async function applyServerState(serverData, preferredConversationId = undefined) {

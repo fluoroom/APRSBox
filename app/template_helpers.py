@@ -171,6 +171,22 @@ def _build_template_context_scoped(
                         "icon": "antenna.svg",
                         "disabled": current_user.role not in ("admin", "operator"),
                     })
+            if item["key"] == "messages" and current_user:
+                for station in list_stations():
+                    station_id = station.get("id")
+                    label = str(station.get("name") or "").strip() or f"Station {station_id}"
+                    station_unread_count = get_unread_inbox_count(station_id=station_id)
+                    navigation.append({
+                        "key": f"messages-{station_id}",
+                        "label": label,
+                        "href": f"/messages/{station_id}",
+                        "roles": ("admin", "operator"),
+                        "visible_roles": ("viewer",),
+                        "icon": "message-alert-outline.svg" if station_unread_count > 0 else "message-reply-text-outline.svg",
+                        "disabled": current_user.role not in ("admin", "operator"),
+                        "has_unread": station_unread_count > 0,
+                        "unread_count": station_unread_count,
+                    })
 
     return {
         "request": request,
