@@ -157,7 +157,11 @@ def _build_template_context_scoped(
                 elif item["key"] == "alerts" and not translated_item["disabled"]:
                     translated_item["attention_count"] = current_alert_count
                     translated_item["has_attention"] = current_alert_count > 0
-            navigation.append(translated_item)
+            message_stations = list_stations() if item["key"] == "messages" and current_user else []
+            # When real stations are configured, per-station inbox links replace
+            # the generic "Messages" entry entirely rather than sitting under it.
+            if not (item["key"] == "messages" and message_stations):
+                navigation.append(translated_item)
             if item["key"] == "stations-config" and current_user:
                 for station in list_stations():
                     station_id = station.get("id")
@@ -172,7 +176,7 @@ def _build_template_context_scoped(
                         "disabled": current_user.role not in ("admin", "operator"),
                     })
             if item["key"] == "messages" and current_user:
-                for station in list_stations():
+                for station in message_stations:
                     station_id = station.get("id")
                     label = str(station.get("name") or "").strip() or f"Station {station_id}"
                     station_unread_count = get_unread_inbox_count(station_id=station_id)
