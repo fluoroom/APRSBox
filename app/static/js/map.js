@@ -116,6 +116,8 @@
     });
     const coverageLayerGroup = window.L.layerGroup();
     const trackLayerGroup = window.L.layerGroup();
+    const traceLayerGroup = window.L.layerGroup();
+    let activeTraceKey = null;
     let markerLayerGroup = null;
     let markerSpiderfier = null;
     let markerSpiderfierActive = false;
@@ -809,9 +811,11 @@
     }).addTo(map);
     coverageLayerGroup.addTo(map);
     trackLayerGroup.addTo(map);
+    traceLayerGroup.addTo(map);
     markerLayerGroup.addTo(map);
     syncMarkerSpiderfierActivation();
     map.on("zoomend", syncMarkerSpiderfierActivation);
+    map.on("movestart", clearStationTrace);
     rulerLayer.addTo(map);
     maidenheadGridLayer.addTo(map);
 
@@ -2223,6 +2227,7 @@
         }
         const clusterGroup = window.L.markerClusterGroup(clusterOptions);
         clusterGroup.on("clustermouseover", function (event) {
+            clearStationTrace();
             const cluster = event.propagatedFrom || event.layer;
             if (!cluster || typeof cluster.getAllChildMarkers !== "function") {
                 return;
@@ -2620,6 +2625,150 @@
         return currentThemeName() === "light" ? 0.72 : 0.82;
     }
 
+    // Matches aprs.fi's heuristic: real callsigns never start with Q, so any
+    // three-letter token starting with Q is a q-construct (qAR, qAC, ...)
+    // rather than a digipeater, marking the RF/internet boundary in the path.
+    const Q_CONSTRUCT_RE = /^Q[A-Z]{2}$/;
+
+    function findStationByCallsign(callsign) {
+        const needle = String(callsign || "").trim().toUpperCase();
+        if (!needle) {
+            return null;
+        }
+        for (const candidate of latestStations) {
+            if (!Number.isFinite(candidate.latitude) || !Number.isFinite(candidate.longitude)) {
+                continue;
+            }
+            const cs = String(candidate.display_callsign || candidate.callsign || "").trim().toUpperCase();
+            if (cs === needle) {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    function parseStationPathTokens(pathRaw) {
+        return String(pathRaw || "")
+            .split(",")
+            .map((token) => token.trim())
+            .filter((token) => token.length > 0)
+            .map((token) => {
+                const used = token.endsWith("*");
+                const callsign = (used ? token.slice(0, -1) : token).trim().toUpperCase();
+                return { callsign, used, isQConstruct: Q_CONSTRUCT_RE.test(callsign) };
+            });
+    }
+
+    // Reconstructs how a packet reached us, aprs.fi-style: the origin station,
+    // then each *used* digipeater in the path whose own beaconed position we
+    // know (unresolved aliases like WIDE2-1 are silently skipped, same as
+    // aprs.fi), ending either at the iGate named after a q-construct (packet
+    // relayed to us over APRS-IS) or at our own station (packet heard direct
+    // on RF).
+    function buildStationTraceHops(station) {
+        if (!Number.isFinite(station.latitude) || !Number.isFinite(station.longitude)) {
+            return null;
+        }
+        const tokens = parseStationPathTokens(station.path);
+        const qIndex = tokens.findIndex((token) => token.isQConstruct);
+        const rfTokens = qIndex === -1 ? tokens : tokens.slice(0, qIndex);
+        const hops = [{
+            latitude: station.latitude,
+            longitude: station.longitude,
+            callsign: station.display_callsign || station.callsign || "",
+        }];
+        for (const token of rfTokens) {
+            if (!token.used) {
+                continue;
+            }
+            const match = findStationByCallsign(token.callsign);
+            if (match) {
+                hops.push({ latitude: match.latitude, longitude: match.longitude, callsign: token.callsign });
+            }
+        }
+        let terminal = null;
+        if (qIndex !== -1) {
+            const igateToken = tokens[qIndex + 1];
+            const match = igateToken ? findStationByCallsign(igateToken.callsign) : null;
+            if (match) {
+                terminal = { latitude: match.latitude, longitude: match.longitude, callsign: igateToken.callsign };
+            }
+        } else if (
+            station.is_rf
+            && Number.isFinite(defaultView.latitude)
+            && Number.isFinite(defaultView.longitude)
+        ) {
+            terminal = { latitude: defaultView.latitude, longitude: defaultView.longitude, callsign: "" };
+        }
+        if (terminal) {
+            hops.push(terminal);
+        }
+        return hops.length >= 2 ? hops : null;
+    }
+
+    function clearStationTrace() {
+        if (activeTraceKey === null) {
+            return;
+        }
+        traceLayerGroup.clearLayers();
+        activeTraceKey = null;
+    }
+
+    function showStationTrace(station) {
+        const key = stationIdentityKey(station);
+        const hops = key ? buildStationTraceHops(station) : null;
+        if (!hops) {
+            clearStationTrace();
+            return;
+        }
+        traceLayerGroup.clearLayers();
+        activeTraceKey = key;
+        const latlngs = hops.map((hop) => [hop.latitude, hop.longitude]);
+        const traceColor = colorForCallsign(station.display_callsign || station.callsign || "");
+        traceLayerGroup.addLayer(window.L.polyline(latlngs, {
+            color: overlayContrastColor(),
+            weight: 4,
+            opacity: overlayContrastOpacity(),
+            lineJoin: "round",
+            lineCap: "round",
+            dashArray: "1,7",
+            interactive: false,
+        }));
+        traceLayerGroup.addLayer(window.L.polyline(latlngs, {
+            color: traceColor,
+            weight: 2,
+            opacity: 0.98,
+            lineJoin: "round",
+            lineCap: "round",
+            dashArray: "1,7",
+            interactive: false,
+        }));
+        hops.forEach((hop, index) => {
+            if (index === 0) {
+                // The origin already has its own station marker.
+                return;
+            }
+            const dot = window.L.circleMarker([hop.latitude, hop.longitude], {
+                radius: 4,
+                color: overlayContrastColor(),
+                fillColor: traceColor,
+                fillOpacity: 0.96,
+                opacity: 0.98,
+                weight: 2,
+                interactive: false,
+            });
+            if (hop.callsign) {
+                dot.bindTooltip(escapeHtml(hop.callsign), {
+                    permanent: true,
+                    direction: "top",
+                    offset: [0, -6],
+                    className: "aprs-tooltip map-trace-hop-tooltip",
+                });
+            }
+            traceLayerGroup.addLayer(dot);
+        });
+    }
+
     function phgDirectionAzimuth(directionValue) {
         if (directionValue === null || directionValue === undefined) {
             return null;
@@ -2806,6 +2955,21 @@
                 sticky: true,
             });
         }
+        if (!marker.aprsboxTraceMouseOverHandler) {
+            marker.aprsboxTraceMouseOverHandler = function () {
+                showStationTrace(marker.aprsStation || station);
+            };
+            marker.on("mouseover", marker.aprsboxTraceMouseOverHandler);
+        }
+        if (!marker.aprsboxTraceMouseOutHandler) {
+            marker.aprsboxTraceMouseOutHandler = function () {
+                const key = stationIdentityKey(marker.aprsStation || station);
+                if (activeTraceKey === key) {
+                    clearStationTrace();
+                }
+            };
+            marker.on("mouseout", marker.aprsboxTraceMouseOutHandler);
+        }
         if (marker.aprsboxClickHandler) {
             marker.off("click", marker.aprsboxClickHandler);
             delete marker.aprsboxClickHandler;
@@ -2827,7 +2991,7 @@
                 continue;
             }
             if (typeof beforeRemove === "function") {
-                beforeRemove(record.layer);
+                beforeRemove(record.layer, key);
             }
             layerGroup.removeLayer(record.layer);
             recordsByKey.delete(key);
@@ -3025,7 +3189,12 @@
             markerLayersByKey,
             markerLayerGroup,
             nextKeys,
-            removeMarkerFromSpiderfier
+            function (layer, key) {
+                removeMarkerFromSpiderfier(layer);
+                if (activeTraceKey === key) {
+                    clearStationTrace();
+                }
+            }
         );
         const prioritizedRecords = prioritizeMarkerRecords(records);
         renderMarkerBatch(prioritizedRecords, 0, renderGeneration, initialMarkerBatchSize);
