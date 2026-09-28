@@ -31,7 +31,7 @@ from app.services.content import (
     get_visible_station_snapshots,
     parse_tnc2_frame,
 )
-from app.services.traffic_source import RF_SOURCE_KIND
+from app.services.traffic_source import RF_SOURCE_KIND, is_rf_source
 from app.services.map_station_state import read_map_station_state
 
 DEFAULT_STATION_ZOOM = 10
@@ -1244,9 +1244,9 @@ def _build_mobile_track_points_by_station_keys(
 
     rows = fetch_all(
         """
-        SELECT line, interface_id, created_at
+        SELECT line, interface_id, created_at, source_kind
         FROM (
-            SELECT line, interface_id, created_at, id
+            SELECT line, interface_id, created_at, source_kind, id
             FROM traffic_frames
             WHERE format IN ('TNC2', 'TNC2-TX')
             ORDER BY created_at DESC, id DESC
@@ -1289,6 +1289,8 @@ def _build_mobile_track_points_by_station_keys(
             "longitude": longitude,
             "interface_id": interface_id,
             "heard_at": str(row["created_at"] or ""),
+            "path": str(parsed.get("path") or "").strip(),
+            "is_rf": is_rf_source(row["source_kind"]),
         }
         points.append(point)
         last_point_by_station_interface[interface_point_key] = point

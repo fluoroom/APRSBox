@@ -181,6 +181,15 @@
                                 </datalist>
                             </label>
                             <label class="map-filter-row">
+                                <span>{{ t("Tail window") }}: <output id="map-filter-tail-window-label">{{ t("All") }}</output></span>
+                                <input type="range" id="map-filter-tail-window" min="0" max="7" step="1" value="0" list="map-filter-tail-window-ticks">
+                                <datalist id="map-filter-tail-window-ticks">
+                                    <option value="0"></option><option value="1"></option><option value="2"></option>
+                                    <option value="3"></option><option value="4"></option><option value="5"></option>
+                                    <option value="6"></option><option value="7"></option>
+                                </datalist>
+                            </label>
+                            <label class="map-filter-row">
                                 <span>{{ t("Callsign") }}</span>
                                 <input type="text" id="map-filter-callsign" placeholder="LU1..." spellcheck="false" autocapitalize="characters">
                             </label>

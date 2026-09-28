@@ -64,6 +64,8 @@
     const maskOpacitySelect = document.getElementById("map-mask-opacity");
     const advancedFilterTimeWindow = document.getElementById("map-filter-time-window");
     const advancedFilterTimeWindowLabel = document.getElementById("map-filter-time-window-label");
+    const advancedFilterTailWindow = document.getElementById("map-filter-tail-window");
+    const advancedFilterTailWindowLabel = document.getElementById("map-filter-tail-window-label");
     const advancedFilterCallsign = document.getElementById("map-filter-callsign");
     const advancedFilterPath = document.getElementById("map-filter-path");
     const advancedFilterHops = document.getElementById("map-filter-hops");
@@ -197,7 +199,7 @@
         { seconds: 300, label: "5m" },
         { seconds: 60, label: "1m" },
     ];
-    const ADVANCED_FILTER_DEFAULTS = { timeWindowIndex: 0, callsign: "", path: "", maxHops: 7 };
+    const ADVANCED_FILTER_DEFAULTS = { timeWindowIndex: 0, tailWindowIndex: 0, callsign: "", path: "", maxHops: 7 };
     let advancedFilters = loadAdvancedFilters();
     const markerLayersByKey = new Map();
     const coverageLayersByKey = new Map();
@@ -1394,11 +1396,19 @@
     }
 
     function rebuildVisibleTrackPoints(points, interfacesById, visibleInterfaceIds) {
+        const tailStep = TIME_WINDOW_STEPS[advancedFilters.tailWindowIndex] || TIME_WINDOW_STEPS[0];
+        const tailWindowSeconds = tailStep.seconds;
         const rebuilt = [];
         for (const point of points || []) {
             const interfaceId = normalizeInterfaceId(point && point.interface_id);
             if (!isStationInterfaceVisible(interfaceId, interfacesById, visibleInterfaceIds)) {
                 continue;
+            }
+            if (tailWindowSeconds > 0) {
+                const age = trackPointAgeSeconds(point && point.heard_at, null);
+                if (age === null || age > tailWindowSeconds) {
+                    continue;
+                }
             }
             const previous = rebuilt[rebuilt.length - 1];
             if (previous && isSameTrackPointPosition(previous, point)) {
@@ -1487,6 +1497,10 @@
             const step = TIME_WINDOW_STEPS[advancedFilters.timeWindowIndex] || TIME_WINDOW_STEPS[0];
             if (advancedFilterTimeWindowLabel) advancedFilterTimeWindowLabel.textContent = step.label;
         };
+        const syncTailWindowLabel = () => {
+            const step = TIME_WINDOW_STEPS[advancedFilters.tailWindowIndex] || TIME_WINDOW_STEPS[0];
+            if (advancedFilterTailWindowLabel) advancedFilterTailWindowLabel.textContent = step.label;
+        };
         const syncHopsLabel = () => {
             if (!advancedFilterHopsLabel) return;
             advancedFilterHopsLabel.textContent = advancedFilters.maxHops >= 7 ? "any" : String(advancedFilters.maxHops);
@@ -1497,6 +1511,14 @@
             advancedFilterTimeWindow.addEventListener("input", () => {
                 advancedFilters.timeWindowIndex = Number.parseInt(advancedFilterTimeWindow.value, 10) || 0;
                 syncTimeWindowLabel();
+                applyAdvancedFilterChange();
+            });
+        }
+        if (advancedFilterTailWindow) {
+            advancedFilterTailWindow.value = String(advancedFilters.tailWindowIndex);
+            advancedFilterTailWindow.addEventListener("input", () => {
+                advancedFilters.tailWindowIndex = Number.parseInt(advancedFilterTailWindow.value, 10) || 0;
+                syncTailWindowLabel();
                 applyAdvancedFilterChange();
             });
         }
@@ -1526,15 +1548,18 @@
             advancedFilterReset.addEventListener("click", () => {
                 advancedFilters = { ...ADVANCED_FILTER_DEFAULTS };
                 if (advancedFilterTimeWindow) advancedFilterTimeWindow.value = String(advancedFilters.timeWindowIndex);
+                if (advancedFilterTailWindow) advancedFilterTailWindow.value = String(advancedFilters.tailWindowIndex);
                 if (advancedFilterCallsign) advancedFilterCallsign.value = advancedFilters.callsign;
                 if (advancedFilterPath) advancedFilterPath.value = advancedFilters.path;
                 if (advancedFilterHops) advancedFilterHops.value = String(advancedFilters.maxHops);
                 syncTimeWindowLabel();
+                syncTailWindowLabel();
                 syncHopsLabel();
                 applyAdvancedFilterChange();
             });
         }
         syncTimeWindowLabel();
+        syncTailWindowLabel();
         syncHopsLabel();
     }
 
@@ -1545,6 +1570,7 @@
             const parsed = JSON.parse(raw);
             return {
                 timeWindowIndex: Math.max(0, Math.min(TIME_WINDOW_STEPS.length - 1, Number.parseInt(parsed.timeWindowIndex, 10) || 0)),
+                tailWindowIndex: Math.max(0, Math.min(TIME_WINDOW_STEPS.length - 1, Number.parseInt(parsed.tailWindowIndex, 10) || 0)),
                 callsign: String(parsed.callsign || "").trim(),
                 path: String(parsed.path || "").trim(),
                 maxHops: Math.max(0, Math.min(7, Number.parseInt(parsed.maxHops, 10) ?? 7)),
@@ -3039,7 +3065,23 @@
                 fillOpacity: 0.94,
                 opacity: 0.96,
                 weight: 2,
-                interactive: false,
+                interactive: true,
+            });
+            const historicalStation = {
+                latitude: point.latitude,
+                longitude: point.longitude,
+                display_callsign: track.display_callsign,
+                callsign: track.display_callsign,
+                path: point.path,
+                is_rf: point.is_rf,
+            };
+            dot.on("mouseover", function () {
+                showStationTrace(historicalStation);
+            });
+            dot.on("mouseout", function () {
+                if (activeTraceKey === stationIdentityKey(historicalStation)) {
+                    clearStationTrace();
+                }
             });
             group.addLayer(dot);
         }
@@ -3262,6 +3304,9 @@
                 if (existing) {
                     trackLayerGroup.removeLayer(existing.layer);
                     trackLayersByKey.delete(key);
+                    if (activeTraceKey === key) {
+                        clearStationTrace();
+                    }
                 }
                 const layer = buildTrackLayer(track);
                 trackLayerGroup.addLayer(layer);
@@ -3271,7 +3316,11 @@
                 });
             }
         }
-        removeMissingLayerRecords(trackLayersByKey, trackLayerGroup, nextKeys);
+        removeMissingLayerRecords(trackLayersByKey, trackLayerGroup, nextKeys, function (_layer, key) {
+            if (activeTraceKey === key) {
+                clearStationTrace();
+            }
+        });
     }
 
     function renderStations(stations, mobileTracks) {
