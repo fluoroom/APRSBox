@@ -152,12 +152,21 @@ class OutboundService:
 
     async def _run(self) -> None:
         while not self._stop_event.is_set():
-            expire_direct_message_timeouts()
-            job = claim_next_outbound_job()
-            if job is None:
-                await self._sleep(self._poll_interval)
-                continue
-            await self._process_job(job)
+            try:
+                expire_direct_message_timeouts()
+                job = claim_next_outbound_job()
+                if job is None:
+                    await self._sleep(self._poll_interval)
+                    continue
+                await self._process_job(job)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                error = str(exc).strip() or exc.__class__.__name__
+                log_event("ERROR", "outbound", f"Outbound worker loop error: {error}")
+                # A transient DB/lock error must not permanently kill the only
+                # outbound TX worker. Back off briefly, then keep draining.
+                await self._sleep(max(1.0, min(30.0, self._poll_interval * 5.0)))
 
     async def _process_job(self, job: dict[str, Any]) -> None:
         job_id = int(job["id"])
