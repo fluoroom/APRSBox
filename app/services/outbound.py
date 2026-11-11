@@ -4,7 +4,7 @@ import json
 import re
 import unicodedata
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.db import fetch_all, fetch_one, get_connection, log_event, utc_now
@@ -30,6 +30,21 @@ OUTBOUND_STATUS_QUEUED = "queued"
 OUTBOUND_STATUS_PROCESSING = "processing"
 OUTBOUND_STATUS_SENT = "sent"
 OUTBOUND_STATUS_FAILED = "failed"
+OUTBOUND_STATUS_CANCELLED = "cancelled"
+STALE_QUEUED_TX_MAX_AGE_SECONDS = 300.0
+STALE_QUEUED_TX_REASON = (
+    "Expired before transmission: the outbound worker was not draining the queue."
+)
+_STALE_QUEUED_TX_KINDS = (
+    OUTBOUND_KIND_BEACON,
+    OUTBOUND_KIND_STATUS,
+    OUTBOUND_KIND_OBJECT,
+    OUTBOUND_KIND_WX,
+    "bulletin",
+    "freq_object",
+    "net_sked",
+    "manual",
+)
 STALE_BEACON_PROCESSING_REASON = "Beacon was not transmitted: APRSBox core restarted while outbound job was processing."
 STALE_WX_PROCESSING_REASON = "WX frame was not transmitted: APRSBox core restarted while outbound job was processing."
 _AX25_CALLSIGN_RE = re.compile(r"^[A-Z0-9]{1,6}$")
@@ -982,6 +997,44 @@ def enqueue_ack_job(
         scheduled_for=scheduled_for,
         internal_tx_only=internal_tx_only,
     )
+
+
+def expire_stale_queued_tx_jobs(
+    *,
+    max_age_seconds: float = STALE_QUEUED_TX_MAX_AGE_SECONDS,
+    now: datetime | None = None,
+) -> int:
+    """Cancel queued periodic/local TX frames that missed their window.
+
+    Beacons, statuses, objects and similar frames are time-sensitive.  If the
+    outbound worker was down for a while, transmitting the whole backlog at
+    once would flood the air and broadcast stale positions.  Called on worker
+    startup with a conservative cutoff.
+    """
+    if max_age_seconds <= 0:
+        return 0
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    cutoff = (current - timedelta(seconds=max_age_seconds)).replace(microsecond=0).isoformat()
+    placeholders = ",".join("?" for _ in _STALE_QUEUED_TX_KINDS)
+    with get_connection() as connection:
+        cursor = connection.execute(
+            f"""
+            UPDATE outbound_jobs
+            SET status = ?, last_error = ?, updated_at = ?
+            WHERE status = ?
+              AND scheduled_at < ?
+              AND kind IN ({placeholders})
+            """,
+            (
+                OUTBOUND_STATUS_CANCELLED,
+                STALE_QUEUED_TX_REASON,
+                utc_now(),
+                OUTBOUND_STATUS_QUEUED,
+                cutoff,
+                *_STALE_QUEUED_TX_KINDS,
+            ),
+        )
+        return int(cursor.rowcount or 0)
 
 
 def claim_next_outbound_job() -> dict[str, Any] | None:

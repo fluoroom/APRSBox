@@ -112,6 +112,11 @@ def traffic_snapshot() -> JSONResponse:
     return JSONResponse(app.state.traffic_monitor.snapshot())
 
 
+@app.get("/api/outbound/health")
+def outbound_health() -> JSONResponse:
+    return JSONResponse(app.state.outbound_service.health_snapshot())
+
+
 @app.get("/api/digi-flows/latency")
 def digi_flow_latency_snapshot() -> JSONResponse:
     snapshot = app.state.digi_flow_runtime.latency_snapshot()

@@ -31,6 +31,7 @@ from app.services.outbound import (
     build_wx_tnc2,
     build_tnc2_kiss_frame,
     claim_next_outbound_job,
+    expire_stale_queued_tx_jobs,
     mark_outbound_job_failed,
     mark_outbound_job_skipped,
     mark_outbound_job_sent,
@@ -90,6 +91,9 @@ def _kiss_frame_hex_preview(frame: bytes, *, max_bytes: int = 32) -> str:
 
 
 class OutboundService:
+    DEFAULT_WORKER_WATCHDOG_INTERVAL_SECONDS = 30.0
+    DEFAULT_WORKER_STALL_RESTART_SECONDS = 120.0
+
     def __init__(
         self,
         *,
@@ -99,6 +103,8 @@ class OutboundService:
         min_tx_gap_seconds: float = 0.35,
         local_tx_base_spacing_seconds: float = 5.0,
         local_tx_jitter_seconds: float = 3.0,
+        worker_watchdog_interval_seconds: float = DEFAULT_WORKER_WATCHDOG_INTERVAL_SECONDS,
+        worker_stall_restart_seconds: float = DEFAULT_WORKER_STALL_RESTART_SECONDS,
     ) -> None:
         self._poll_interval = poll_interval
         self._traffic_monitor = traffic_monitor
@@ -113,7 +119,17 @@ class OutboundService:
         self._local_tx_forwarded_event_order: list[str] = []
         self._local_tx_forwarded_event_limit = 512
         self._task: asyncio.Task[None] | None = None
+        self._watchdog_task: asyncio.Task[None] | None = None
         self._stop_event = asyncio.Event()
+        self._worker_watchdog_interval_seconds = max(0.05, float(worker_watchdog_interval_seconds))
+        self._worker_stall_restart_seconds = max(0.05, float(worker_stall_restart_seconds))
+        self._worker_started_at: str | None = None
+        self._last_worker_tick_monotonic: float | None = None
+        self._worker_restart_count = 0
+        self._consecutive_loop_errors = 0
+        self._last_loop_error: str | None = None
+        self._last_loop_error_at: str | None = None
+        self._active_job_id: int | None = None
 
     async def start(self) -> None:
         if self._task is not None:
@@ -137,36 +153,185 @@ class OutboundService:
             )
             log_event("WARNING", "outbound", message)
             log_event("WARNING", "wx", message)
+        try:
+            expired_jobs = expire_stale_queued_tx_jobs()
+        except Exception as exc:
+            # Housekeeping must never prevent the TX worker from starting.
+            expired_jobs = 0
+            self._safe_log(
+                "WARNING",
+                "outbound",
+                f"Could not cancel stale queued TX jobs before startup: {str(exc).strip() or exc.__class__.__name__}",
+            )
+        if expired_jobs:
+            self._safe_log(
+                "WARNING",
+                "outbound",
+                (
+                    f"Cancelled {expired_jobs} stale queued TX job(s) before starting the outbound worker: "
+                    "their transmission window had already passed."
+                ),
+            )
+        self._consecutive_loop_errors = 0
+        self._last_loop_error = None
+        self._last_loop_error_at = None
+        self._worker_started_at = utc_now()
+        self._last_worker_tick_monotonic = time.monotonic()
         self._task = asyncio.create_task(self._run(), name="aprsbox-outbound-worker")
+        self._watchdog_task = asyncio.create_task(self._watchdog(), name="aprsbox-outbound-watchdog")
 
     async def stop(self) -> None:
         self._stop_event.set()
-        if self._task is None:
+        watchdog = self._watchdog_task
+        self._watchdog_task = None
+        if watchdog is not None:
+            watchdog.cancel()
+            try:
+                await watchdog
+            except asyncio.CancelledError:
+                pass
+        task = self._task
+        self._task = None
+        self._active_job_id = None
+        if task is None:
             return
-        self._task.cancel()
+        task.cancel()
         try:
-            await self._task
+            await task
         except asyncio.CancelledError:
             pass
-        self._task = None
 
     async def _run(self) -> None:
         while not self._stop_event.is_set():
+            self._last_worker_tick_monotonic = time.monotonic()
             try:
-                expire_direct_message_timeouts()
-                job = claim_next_outbound_job()
-                if job is None:
-                    await self._sleep(self._poll_interval)
-                    continue
-                await self._process_job(job)
+                await self._run_once()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                self._consecutive_loop_errors += 1
                 error = str(exc).strip() or exc.__class__.__name__
-                log_event("ERROR", "outbound", f"Outbound worker loop error: {error}")
-                # A transient DB/lock error must not permanently kill the only
-                # outbound TX worker. Back off briefly, then keep draining.
-                await self._sleep(max(1.0, min(30.0, self._poll_interval * 5.0)))
+                self._last_loop_error = error
+                self._last_loop_error_at = utc_now()
+                # The error path touches SQLite too (log_event).  If "database
+                # is locked" is what raised, a plain log_event() would raise
+                # again from inside the handler and silently kill the only TX
+                # worker -- exactly the outage this loop must survive.
+                self._safe_log(
+                    "ERROR",
+                    "outbound",
+                    f"Outbound worker loop error #{self._consecutive_loop_errors}: {error}",
+                )
+                await self._sleep(self._loop_error_backoff_seconds())
+            else:
+                self._consecutive_loop_errors = 0
+
+    async def _run_once(self) -> None:
+        expire_direct_message_timeouts()
+        job = claim_next_outbound_job()
+        if job is None:
+            await self._sleep(self._poll_interval)
+            return
+        self._active_job_id = int(job["id"])
+        try:
+            await self._process_job(job)
+        finally:
+            self._active_job_id = None
+
+    async def _watchdog(self) -> None:
+        while not self._stop_event.is_set():
+            await self._sleep(self._worker_watchdog_interval_seconds)
+            if self._stop_event.is_set():
+                return
+            worker = self._task
+            if worker is None:
+                return
+            if worker.done():
+                if worker.cancelled():
+                    reason = "was cancelled"
+                else:
+                    exception = worker.exception()
+                    detail = str(exception).strip() if exception is not None else ""
+                    if exception is not None:
+                        reason = f"crashed ({exception.__class__.__name__}: {detail})"
+                    else:
+                        reason = "stopped unexpectedly"
+                self._restart_worker(reason)
+                continue
+            last_tick = self._last_worker_tick_monotonic
+            if last_tick is None:
+                continue
+            stalled_for = time.monotonic() - last_tick
+            if stalled_for >= self._worker_stall_restart_seconds:
+                self._restart_worker(f"made no progress for {stalled_for:.0f}s")
+
+    def _restart_worker(self, reason: str) -> None:
+        self._worker_restart_count += 1
+        self._safe_log(
+            "ERROR",
+            "outbound",
+            f"Outbound TX worker {reason}; restarting it (restart #{self._worker_restart_count}).",
+        )
+        job_id = self._active_job_id
+        if job_id is not None:
+            try:
+                mark_outbound_job_failed(
+                    job_id,
+                    "Outbound TX worker was restarted before the transmission was confirmed.",
+                )
+            except Exception:
+                pass
+            self._active_job_id = None
+        previous = self._task
+        if previous is not None and not previous.done():
+            previous.cancel()
+        self._last_worker_tick_monotonic = time.monotonic()
+        self._task = asyncio.create_task(self._run(), name="aprsbox-outbound-worker")
+
+    def _loop_error_backoff_seconds(self) -> float:
+        base = max(1.0, min(30.0, float(self._poll_interval) * 5.0))
+        exponent = max(0, min(self._consecutive_loop_errors - 1, 4))
+        return min(30.0, base * (2**exponent))
+
+    @staticmethod
+    def _safe_log(level: str, category: str, message: str) -> None:
+        try:
+            log_event(level, category, message)
+        except Exception:
+            # Never let diagnostics take down the worker that is supposed to
+            # recover from the very error being reported.
+            pass
+
+    def health_snapshot(self) -> dict[str, Any]:
+        worker = self._task
+        watchdog = self._watchdog_task
+        last_tick_age: float | None = None
+        if self._last_worker_tick_monotonic is not None:
+            last_tick_age = round(
+                max(0.0, time.monotonic() - self._last_worker_tick_monotonic),
+                1,
+            )
+        queued_jobs: int | None = None
+        try:
+            row = fetch_one(
+                "SELECT COUNT(*) AS total FROM outbound_jobs WHERE status = ?",
+                ("queued",),
+            )
+            queued_jobs = int(row["total"]) if row is not None else 0
+        except Exception:
+            queued_jobs = None
+        return {
+            "worker_running": bool(worker is not None and not worker.done()),
+            "watchdog_running": bool(watchdog is not None and not watchdog.done()),
+            "worker_started_at": self._worker_started_at,
+            "worker_restart_count": self._worker_restart_count,
+            "worker_last_tick_age_seconds": last_tick_age,
+            "active_job_id": self._active_job_id,
+            "consecutive_loop_errors": self._consecutive_loop_errors,
+            "last_loop_error": self._last_loop_error,
+            "last_loop_error_at": self._last_loop_error_at,
+            "queued_jobs": queued_jobs,
+        }
 
     async def _process_job(self, job: dict[str, Any]) -> None:
         job_id = int(job["id"])
